@@ -2300,8 +2300,9 @@ async function showPseudoknot(crossings, structure) {
   const [a, b] = crossings[0];
   addMessage('warn',
     `当前结构含假结：${fmtPair(a)} 与 ${fmtPair(b)} 互相交叉。`
-    + '近邻热力学模型不支持假结，所以这个结构算不出 ΔG —— 这是模型的固有限制，不是程序出错。');
-  addMessage('note', '结构图仍可正常显示与编辑。要恢复 ΔG，解除交叉的其中一对即可。');
+    + '假结在图上用红色虚线画出，排版与编辑都不受影响；'
+    + '算不出 ΔG 是因为近邻热力学模型本身不支持假结，属于模型的固有限制。');
+  addMessage('note', '要让 ΔG 恢复，解除交叉的其中一对即可。');
 
   try {
     const data = await api('/api/layout', {

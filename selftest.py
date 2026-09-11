@@ -75,8 +75,10 @@ def main() -> int:
         d = r.json()
         check("HTTP 200", True, f"ΔG={d['energy']}")
         check("识别出假结", d["has_pseudoknot"] is True)
-        check("假结结构自动降级为环形布局",
-              d["layout"]["layout"] == "circular" and bool(d["layout"]["fallback_reason"]))
+        # 假结**不再**导致降级：naview 能照常排版，交叉配对由前端用红色虚线标出。
+        # 早先这里断言的是「自动降级为环形」，那个行为已被去掉。
+        check("假结结构仍用 naview 排版（不再降级）",
+              d["layout"]["layout"] == "naview" and not d["layout"]["fallback_reason"])
         print(f"   结构: {d['structure'][:60]}...")
 
     print("\n=== /api/predict 带约束 ===")
@@ -185,8 +187,8 @@ def main() -> int:
             "with_probabilities": False,
         }).json()
         check("ProbKnot 检出假结", d["has_pseudoknot"] is True)
-        check("假结自动回退到环形布局",
-              d["layout"]["layout"] == "circular" and bool(d["layout"]["fallback_reason"]))
+        check("含假结的结构仍返回 naview 坐标",
+              d["layout"]["layout"] == "naview" and len(d["layout"]["points"]) == len(SEQ))
 
         # PropKnot/MaxExpect 不支持硬约束，必须明确报错而不是静默忽略
         con = list("." * len(SEQ))

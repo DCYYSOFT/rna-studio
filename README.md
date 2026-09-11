@@ -10,8 +10,8 @@
 
 | 你的系统 | 安装包 | 打开方式 |
 |---|---|---|
-| macOS（Apple Silicon） | [RNA-Studio-0.0.4-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.4/RNA-Studio-0.0.4-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | [RNA-Studio-0.0.4-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.4/RNA-Studio-0.0.4-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+| macOS（Apple Silicon） | [RNA-Studio-0.0.5-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.5/RNA-Studio-0.0.5-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-0.0.5-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.5/RNA-Studio-0.0.5-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
 
 全部版本见 [Releases](../../releases)。
 
@@ -104,7 +104,7 @@ python desktop.py        # 以原生窗口方式启动（需先装 requirements-
 
 | 风格 | 说明 |
 |---|---|
-| **经典结构图** | 三叶草/茎环画法（naview），最接近文献插图。**不能显示假结**，遇到假结会自动切到环形并给出提示。 |
+| **经典结构图** | 三叶草/茎环画法（naview），最接近文献插图。**假结可正常显示**——用红色虚线把交叉的配对画出来，排版与编辑都不受影响。 |
 | **环形** | 碱基排在圆周上，配对画成圆内弦，相当于 VARNA 的 radiate。**可以显示假结**。 |
 | **弧线图** | 碱基水平排列、配对画成上方弧线。长序列和带假结的结构看这个最清楚。 |
 | **点阵图** | 配对概率矩阵，是 RNA 领域最标准的「第二种视角」。上三角的方块面积正比于配对概率，下三角是当前结构（与上三角镜像）。螺旋会呈现为**垂直于主对角线的短串**——结构点落在方块密集处，说明这个配对在系综里站得住脚。 |
@@ -298,8 +298,9 @@ Illustrator / Inkscape 编辑；PNG 是 3 倍超采样，适合放进 PPT 或文
 
 ## 几个容易踩的点
 
-**假结**：ViennaRNA 的近邻热力学模型不支持假结，因此含假结的结构算不出 ΔG，
-布局也会自动降级为环形。这是模型的固有限制，不是程序的问题。
+**假结**：含假结的结构**能正常排版和编辑**，交叉的配对用红色虚线标出。
+但 ViennaRNA 的近邻热力学模型不支持假结，所以这种结构**算不出 ΔG** ——
+这是模型的固有限制，不是程序的问题。想算 ΔG 就解除交叉的其中一对。
 
 **能量单位为 kcal/mol，温度为 °C**（界面上填摄氏度，引擎内部的单位换算已处理）。
 

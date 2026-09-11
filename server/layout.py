@@ -4,7 +4,9 @@
 
 * ``naview``  —— 经典 RNA 二级结构画法（茎环/三叶草）。直接调用 ViennaRNA 的
   ``naview_xy_coordinates``，进程内调用、毫秒级，适合手动编辑后即时重排。
-  注意：naview 无法处理交叉配对（假结），遇到假结会自动降级为 ``circular``。
+  **假结不影响使用**：实测 naview 拿到含 ``[]`` ``{}`` ``<>`` 的结构照常排版，
+  交叉配对会照常画出坐标，只是需要用不同的线型标注（见前端）。
+  早先版本一遇假结就整张图降级为环形，是没必要的。
 * ``circular`` —— 碱基均匀排布在圆周上，配对画成圆内的弧。类似 VARNA 的 radiate 风格，
   **可以显示假结**。
 * ``linear``   —— 碱基水平排列，配对画成上方的半圆弧。适合长序列和带假结的结构。
@@ -107,23 +109,16 @@ def linear_layout(seq: str, pairs: list[tuple[int, int]], breaks: list[int]) -> 
 
 
 # ------------------------------------------------------------------- dispatch
-FALLBACK_REASON_NAVIEW = (
-    "当前结构包含假结（交叉配对），naview 布局无法处理，已自动切换为环形布局。"
-)
-
-
 def build(seq: str, dotbracket: str, *, mode: str = "naview",
           breaks: list[int] | None = None) -> Layout:
-    """按 mode 生成布局。mode 不受支持或 naview 遇假结时自动降级。"""
+    """按 mode 生成布局。naview 真的失败时才降级为环形。"""
     parsed = parse(dotbracket, seq)
     breaks = breaks or []
     mode = (mode or "naview").lower()
 
     if mode == "naview":
-        if parsed.has_pseudoknot:
-            lay = circular_layout(seq, parsed.pairs, breaks)
-            lay.fallback_reason = FALLBACK_REASON_NAVIEW
-            return lay
+        # 假结不构成降级理由：naview 能给出正常排布，交叉配对照常画线即可。
+        # 早先版本在这里对 has_pseudoknot 直接返回环形，等于一有假结就废掉茎环图。
         try:
             return naview_layout(seq, parsed.pairs, breaks)
         except StructureError as e:
