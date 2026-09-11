@@ -31,15 +31,48 @@ WINDOW_W, WINDOW_H = 1440, 900
 MIN_W, MIN_H = 900, 600
 
 
-def _force_utf8_streams() -> None:
-    """Windows 上 stdout/stderr 默认用系统代码页（cp1252/cp936），
-    打印中文会抛 UnicodeEncodeError；打包成窗口程序时它们甚至可能是 None。
-    统一改成 UTF-8 + 出错不抛异常，保证任何一条日志都不会把程序打挂。"""
-    import sys as _s
+def _log_candidates() -> list[Path]:
+    """日志文件的候选位置（按优先级）。"""
+    out: list[Path] = []
+    env = os.environ.get("RNA_STUDIO_LOG_FILE")
+    if env:
+        out.append(Path(env))
+    if getattr(sys, "frozen", False):
+        out.append(Path(sys.executable).resolve().parent / "rna-studio.log")
+    out.append(Path.home() / "rna-studio.log")
+    return out
 
+
+def _open_fallback_stream():
+    """给缺失的标准流找一个真实的落点：优先日志文件，实在不行丢进黑洞。"""
+    for p in _log_candidates():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return p.open("a", encoding="utf-8", errors="replace", buffering=1)
+        except OSError:
+            continue
+    return open(os.devnull, "w", encoding="utf-8")
+
+
+def _force_utf8_streams() -> None:
+    """让 sys.stdout / sys.stderr 一定可用。
+
+    打包成窗口程序后（Windows 的 console=False 尤其如此）标准流是 None。
+    而不少库会直接调用它们，例如 uvicorn 的日志 formatter 会执行
+    ``sys.stdout.isatty()`` —— 实测这会让 uvicorn.Config 构造直接抛
+    AttributeError，后端起不来，用户看到的现象就是「双击了没反应」。
+    所以这里不仅要处理编码，还要保证流**存在**。
+
+    Windows 标准流默认还是 cp1252/cp936，打印中文同样会抛
+    UnicodeEncodeError，因此统一重新配置成 UTF-8。
+    """
+    fallback = None
     for name in ("stdout", "stderr"):
-        stream = getattr(_s, name, None)
+        stream = getattr(sys, name, None)
         if stream is None:
+            if fallback is None:
+                fallback = _open_fallback_stream()
+            setattr(sys, name, fallback)
             continue
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
