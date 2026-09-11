@@ -1900,6 +1900,7 @@ function bindEvents() {
     const mod = ev.metaKey || ev.ctrlKey;
 
     if (ev.key === 'Escape') {
+      if (!el.baseEditor.hidden) { closeBaseEditor(); return; }
       if (!el.compareOverlay.hidden) { closeCompare(); return; }
       if (isArrange() && (state.pickedBase != null || state.snapGuides.length)) {
         state.pickedBase = null; state.pickedUnit = null; state.snapGuides = [];
