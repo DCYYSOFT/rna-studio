@@ -117,6 +117,12 @@ macOS 首次打开会提示「无法验证开发者」，这是正常的（本�
 应用自带运行环境（含 Java），不需要额外安装任何东西。
 TXT
 
+# 给 DMG 卷本身也设个图标（需要 SetFile，没装 Xcode 命令行工具时跳过）
+cp -f "$ROOT/packaging/icons/icon.icns" "$STAGE/.VolumeIcon.icns" 2>/dev/null || true
+if command -v SetFile >/dev/null 2>&1; then
+  SetFile -a C "$STAGE" 2>/dev/null || true
+fi
+
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 

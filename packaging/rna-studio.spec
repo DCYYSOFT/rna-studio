@@ -31,10 +31,16 @@ ROOT = Path(SPECPATH).resolve().parent
 DESKTOP_ENTRY = str(ROOT / "desktop.py")
 APP_NAME = "RNA Studio"
 
+# 应用图标：macOS 用 .icns、Windows 用 .ico，由 packaging/icons/ 提供
+ICON_ICNS = ROOT / "packaging" / "icons" / "icon.icns"
+ICON_ICO = ROOT / "packaging" / "icons" / "icon.ico"
+ICON_PNG = ROOT / "packaging" / "icons" / "icon.png"
+
 # ─────────────────────────── 随包数据 ───────────────────────────
 
 datas = [
     (str(ROOT / "web"), "web"),
+    (str(ROOT / "packaging" / "icons"), "icons"),
     (str(ROOT / "vendor"), "vendor"),
     (str(ROOT / "example_data"), "example_data"),
 ]
@@ -183,6 +189,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ICON_ICO) if sys.platform == "win32" else None,
 )
 
 coll = COLLECT(
@@ -202,7 +209,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name=f"{APP_NAME}.app",
-        icon=None,
+        icon=str(ICON_ICNS) if ICON_ICNS.exists() else None,
         bundle_identifier="io.rnastudio.app",
         info_plist={
             "CFBundleName": APP_NAME,
