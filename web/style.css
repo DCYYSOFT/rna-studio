@@ -826,6 +826,138 @@ textarea:focus, input:focus, select:focus {
 /* 点阵图模式下画布不需要手型光标 */
 #canvas image { image-rendering: pixelated; }
 
+/* ══════════════════ 序列条 ══════════════════ */
+
+.seq-strip {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface);
+}
+
+.seq-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px 4px;
+}
+.seq-strip-title { font-size: 12px; font-weight: 600; }
+.seq-strip-hint { font-size: 11.5px; color: var(--muted-solid); flex: 1 1 auto; }
+.seq-strip-head .link-btn { flex: 0 0 auto; }
+
+.seq-strip-body {
+  max-height: 92px;
+  overflow-y: auto;
+  padding: 0 12px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.seq-strip.is-collapsed .seq-strip-body { display: none; }
+.strip-empty { color: var(--muted-solid); font-family: var(--sans); font-size: 12px; }
+
+.seq-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+.seq-pos {
+  flex: 0 0 auto;
+  width: 4ch;
+  text-align: right;
+  color: var(--muted-solid);
+  font-size: 10.5px;
+  user-select: none;
+}
+.seq-chars { flex: 1 1 auto; letter-spacing: .02em; }
+
+.ss-char {
+  cursor: pointer;
+  padding: 0 1px;
+  border-radius: 2px;
+  color: var(--ink-soft);
+}
+/* 每 10 个加一点间隔，方便数位置 */
+.ss-char.ss-tick { margin-right: .55em; }
+
+/* 悬停联动的高亮 */
+.ss-char.is-hot {
+  background: var(--meter-num);
+  color: #1B2430;
+  font-weight: 700;
+}
+
+/* 因改碱基而配对不合法 */
+.ss-char.is-bad {
+  color: var(--danger);
+  text-decoration: underline wavy var(--danger);
+  text-underline-offset: 3px;
+}
+
+/* 反向高亮：鼠标在序列条上时，结构上对应的碱基也亮起来 */
+.nt.is-hot .nt-circle { stroke: #D2912A; stroke-width: calc(var(--u) * 0.72); }
+
+/* ══════════════════ 调整排版 ══════════════════ */
+
+.arrange-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid #CFE1F3;
+  color: #234C77;
+  font-size: 12px;
+}
+.arrange-banner .link-btn { margin-left: auto; color: #234C77; }
+
+.canvas-scroll.is-arranging #canvas .nt-circle { cursor: move; }
+.canvas-scroll.is-arranging #canvas .nt-circle:hover { stroke-width: calc(var(--u) * 0.9); }
+
+/* 改碱基后不再合法的配对：标红 + 虚线，与假结的样式区分开 */
+.bp-line.is-invalid { stroke: var(--danger); stroke-dasharray: calc(var(--u) * 0.8) calc(var(--u) * 0.6); }
+
+/* ══════════════════ 碱基编辑弹窗 ══════════════════ */
+
+.base-editor {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow-2);
+}
+.base-editor-pos { font-family: var(--mono); font-size: 11.5px; color: var(--muted-solid); }
+.base-editor-cur {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  padding: 0 4px;
+}
+.base-editor-btns { display: flex; gap: 4px; }
+
+.base-btn {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  width: 28px; height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 0;
+}
+.base-btn:hover { background: var(--surface-2); border-color: var(--accent); }
+.base-btn.is-cur { background: var(--accent); border-color: var(--accent); color: #fff; }
+
 /* ══════════════════ 结构域标注 ══════════════════ */
 
 .domain-form {

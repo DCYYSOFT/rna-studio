@@ -38,6 +38,12 @@ const state = {
   locatedRange: null,       // 序列定位的高亮区间 [start, end]
   lastRenderedPoints: null, // 上一次真正画出来的坐标，用于折叠过渡动画
   lastRenderedPairs: [],
+  invalidPairs: new Set(),  // 因改碱基而变得不合法的配对（标红提示，但不自动解除）
+  manualPoints: null,       // 手动拖动后的坐标；null 表示用后端给的自动布局
+  arrange: false,           // 「调整排版」模式：拖动移动螺旋而不是平移画布
+  stripNodes: [],           // 序列条的字符节点缓存，按索引取用
+  stripHot: null,           // 序列条上当前高亮的字符
+  canvasHot: null,          // 画布上因悬停序列条而高亮的碱基
   history: [],              // 结构编辑历史（快照栈）
   historyIndex: -1,         // 当前处在历史中的位置，-1 表示还没有记录
 };
@@ -73,6 +79,12 @@ const el = {
   historyList: $('history-list'),
   locateInput: $('locate-input'), btnLocate: $('btn-locate'),
   bpStyleDraw: $('bp-style-draw'),
+  stripBody: $('seq-strip-body'), stripHint: $('seq-strip-hint'),
+  btnStripToggle: $('btn-strip-toggle'), seqStrip: $('seq-strip'),
+  btnArrange: $('btn-arrange'), arrangeBanner: $('arrange-banner'),
+  btnRestoreLayout: $('btn-restore-layout'),
+  baseEditor: $('base-editor'), baseEditorPos: $('base-editor-pos'),
+  baseEditorCur: $('base-editor-cur'), baseEditorBtns: $('base-editor-btns'),
   domainName: $('domain-name'), domainStart: $('domain-start'), domainEnd: $('domain-end'),
   domainList: $('domain-list'), btnDomainAdd: $('btn-domain-add'),
   btnDomainFromRange: $('btn-domain-from-range'), btnFoldDomains: $('btn-fold-domains'),
@@ -268,6 +280,8 @@ function syncSequence() {
   }
   syncConstraintReadouts();
   el.statModeWrap.hidden = state.mode === 'cofold';
+  renderSeqStrip();
+  state.invalidPairs = new Set();
 }
 
 /* ────────────────────────────── 渲染 ────────────────────────────── */
@@ -411,6 +425,7 @@ function drawStructure(svgEl, ctx) {
     sequence, layout, pairs = [], breaks = [], forbidden = new Set(),
     selected = null, colorMap = null, period = 0, diffPairs = null,
     bands = [], interactive = true, colorRamp = null, bpStyle = '',
+    invalidPairs = null,
   } = ctx;
 
   const n = sequence.length;
@@ -507,7 +522,10 @@ function drawStructure(svgEl, ctx) {
     if (i >= pts.length || j >= pts.length) continue;
     const inSel = selected != null && (i === selected || j === selected);
     const isDiff = diffPairs ? diffPairs.has(`${i},${j}`) : false;
-    const cls = 'bp-line' + (isDiff ? ' is-diff' : '') + (inSel ? ' is-sel' : '');
+    // 改碱基后不再合法的配对标红：只提示，不自动解除
+    const isBad = invalidPairs ? invalidPairs.has(`${i},${j}`) || invalidPairs.has(`${j},${i}`) : false;
+    const cls = 'bp-line' + (isDiff ? ' is-diff' : '')
+      + (isBad ? ' is-invalid' : '') + (inSel ? ' is-sel' : '');
 
     // 梯形画法：每对画成一小段横杠，视觉上像螺旋的梯级
     if (bpStyle === 'ladder') {
@@ -682,9 +700,14 @@ function render() {
   el.canvasEmpty.hidden = true;
   renderLegend();
 
+  // 手动拖过排版就用那一份坐标，否则用后端算的
+  const layoutForDraw = state.manualPoints
+    ? { ...state.result.layout, points: state.manualPoints }
+    : state.result.layout;
+
   const geo = drawStructure(el.canvas, {
     sequence: state.sequence,
-    layout: state.result.layout,
+    layout: layoutForDraw,
     pairs: state.pairs,
     breaks: state.breaks,
     forbidden: state.forbidden,
@@ -695,6 +718,7 @@ function render() {
     interactive: !state.readOnly,
     colorRamp: state.colorMode === 'rainbow' ? rainbowColor : null,
     bpStyle: el.bpStyleDraw ? el.bpStyleDraw.value : '',
+    invalidPairs: state.invalidPairs,
   });
 
   if (!geo) return;
@@ -704,7 +728,7 @@ function render() {
 
   // 折叠过渡动画：让碱基从上一帧的位置弹性地滑到新位置。
   // 若位置没有实质变化（如只是切换配色）就跳过，免得白跑一遍。
-  const newPts = state.result.layout.points;
+  const newPts = layoutForDraw.points;
   const prevPts = state.lastRenderedPoints;
   let moved = false;
   if (prevPts && prevPts.length === newPts.length) {
@@ -737,6 +761,7 @@ function baseFromEvent(ev) {
 }
 
 function showHover(i, ev) {
+  setStripHighlight(i);          // 悬停结构 → 高亮序列条对应位置
   if (i == null) { el.hoverReadout.classList.remove('is-on'); return; }
   const pm = pairMap();
   const partner = pm.get(i);
@@ -866,7 +891,25 @@ function setupCanvasInteraction() {
   }, { passive: false });
 
   let panning = null;
+  let arrangeDrag = null;
+
   el.canvasScroll.addEventListener('pointerdown', (ev) => {
+    // 调整排版模式：拖碱基 = 移动它所在的螺旋/环
+    if (state.arrange && !state.readOnly) {
+      const unit = baseFromEvent(ev);
+      if (unit != null) {
+        const rect = el.canvas.getBoundingClientRect();
+        const v = state.view;
+        const scale = Math.min(rect.width / v.w, rect.height / v.h) || 1;
+        if (!state.manualPoints && state.result && state.result.layout) {
+          state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
+        }
+        arrangeDrag = { base: unit, x: ev.clientX, y: ev.clientY, scale, moved: false };
+        el.canvasScroll.setPointerCapture(ev.pointerId);
+        ev.preventDefault();
+        return;
+      }
+    }
     if (baseFromEvent(ev)) return;
     const rect = el.canvas.getBoundingClientRect();
     const v = state.view;
@@ -876,12 +919,37 @@ function setupCanvasInteraction() {
     el.canvasScroll.setPointerCapture(ev.pointerId);
   });
   el.canvasScroll.addEventListener('pointermove', (ev) => {
+    if (arrangeDrag) {
+      const dx = (ev.clientX - arrangeDrag.x) / arrangeDrag.scale;
+      const dy = (ev.clientY - arrangeDrag.y) / arrangeDrag.scale;
+      if (dx || dy) {
+        moveUnit(arrangeDrag.base, dx, dy);
+        arrangeDrag.x = ev.clientX;
+        arrangeDrag.y = ev.clientY;
+        arrangeDrag.moved = true;
+        refreshManualBounds();
+        state.fitPending = false;
+        render();
+      }
+      return;
+    }
     if (!panning) return;
     state.view.x = panning.vx - (ev.clientX - panning.x) / panning.scale;
     state.view.y = panning.vy - (ev.clientY - panning.y) / panning.scale;
     applyViewBox();
   });
   const endPan = (ev) => {
+    if (arrangeDrag) {
+      const moved = arrangeDrag.moved;
+      arrangeDrag = null;
+      try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
+      if (moved) {
+        pushHistory('调整排版');
+        saveSession();
+        toast('排版已调整；点「恢复自动布局」可还原');
+      }
+      return;
+    }
     if (!panning) return;
     panning = null;
     el.canvasScroll.classList.remove('is-panning');
@@ -982,8 +1050,11 @@ function adoptResult(data, { keepSelection = false } = {}) {
     if ((el.constraints.value || '').replace(/\s/g, '').length !== n) resetConstraintString(n);
   }
 
+  // 重新折叠/评估后回到自动布局，并重算哪些配对不合法
+  state.manualPoints = null;
   const parsed = parseStructure(data.structure);
   state.pairs = parsed.pairs.map((p) => [p[0], p[1]]);
+  state.invalidPairs = computeInvalidPairs();
   state.breaks = data.layout ? (data.layout.breaks || []) : [];
 
   state.probMap.clear();
@@ -1488,6 +1559,58 @@ function bindEvents() {
       el.importDialog.showModal();   // 重新打开以便修改
     }
   });
+
+  // ── 序列条的悬停联动与碱基编辑 ──
+  el.baseEditorBtns.innerHTML = ['A', 'U', 'G', 'C']
+    .map((b) => `<button class="base-btn" data-base="${b}" type="button">${b}</button>`).join('');
+  el.baseEditorBtns.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-base]');
+    if (btn && baseEditorFor != null) setBase(baseEditorFor, btn.dataset.base);
+  });
+  document.addEventListener('click', (ev) => {
+    if (el.baseEditor.hidden) return;
+    if (ev.target.closest('#base-editor')) return;
+    closeBaseEditor();
+  }, true);
+  window.addEventListener('resize', closeBaseEditor);
+
+  el.stripBody.addEventListener('mousemove', (ev) => {
+    const ch = ev.target.closest('.ss-char');
+    setCanvasHighlight(ch ? +ch.dataset.i : null);
+  });
+  el.stripBody.addEventListener('mouseleave', () => setCanvasHighlight(null));
+  el.stripBody.addEventListener('click', (ev) => {
+    const ch = ev.target.closest('.ss-char');
+    if (!ch) return;
+    state.selection = +ch.dataset.i;
+    render();
+  });
+  el.stripBody.addEventListener('dblclick', (ev) => {
+    const ch = ev.target.closest('.ss-char');
+    if (!ch) return;
+    ev.preventDefault();
+    state.selection = +ch.dataset.i;
+    render();
+    openBaseEditor(+ch.dataset.i, ch);
+  });
+  el.btnStripToggle.addEventListener('click', () => {
+    const collapsed = el.seqStrip.classList.toggle('is-collapsed');
+    el.btnStripToggle.textContent = collapsed ? '展开' : '收起';
+  });
+
+  // 结构图上双击碱基也能改
+  el.canvas.addEventListener('dblclick', (ev) => {
+    const i = baseFromEvent(ev);
+    if (i == null || state.readOnly) return;
+    ev.preventDefault();
+    state.selection = i;
+    render();
+    openBaseEditor(i, ev.target);
+  });
+
+  // ── 调整排版 ──
+  el.btnArrange.addEventListener('click', () => setArrange(!state.arrange));
+  el.btnRestoreLayout.addEventListener('click', restoreAutoLayout);
 
   // ── 结构域标注 ──
   el.btnDomainAdd.addEventListener('click', addDomain);
@@ -2526,6 +2649,7 @@ function collectSession() {
     pairs: state.pairs,
     forbidden: [...state.forbidden],
     domains: state.domains.map((d) => ({ ...d })),
+    manualPoints: state.manualPoints ? state.manualPoints.map((p) => ({ x: p.x, y: p.y })) : null,
   };
 }
 
@@ -2581,6 +2705,8 @@ function restoreSession() {
   state.pairs = Array.isArray(d.pairs) ? d.pairs.map((p) => [p[0], p[1]]) : [];
   state.forbidden = new Set(d.forbidden || []);
   state.domains = Array.isArray(d.domains) ? d.domains : [];
+  state.manualPoints = Array.isArray(d.manualPoints) && d.manualPoints.length === d.sequence.length
+    ? d.manualPoints.map((p) => ({ x: p.x, y: p.y })) : null;
   state.colorMode = el.colorMode.value;
 
   el.constraints.value = d.constraints && d.constraints.length === d.sequence.length
@@ -2797,6 +2923,326 @@ function rainbowColor(t) {
 }
 
 
+/* ═══════════════════ 序列条（与结构双向联动） ═══════════════════ */
+
+const STRIP_PER_LINE = 60;
+
+/**
+ * 把序列渲染成一条可交互的线性条。
+ * 悬停结构上的碱基会高亮这里的对应字符，反之亦然——长链上靠这个定位最快。
+ */
+function renderSeqStrip() {
+  const seq = state.sequence;
+  const body = el.stripBody;
+  if (!body) return;
+
+  if (!seq) {
+    body.innerHTML = '<span class="strip-empty">还没有序列</span>';
+    state.stripNodes = [];
+    state.stripHot = null;
+    return;
+  }
+
+  const parts = [];
+  for (let start = 0; start < seq.length; start += STRIP_PER_LINE) {
+    const chunk = seq.slice(start, start + STRIP_PER_LINE);
+    const chars = [];
+    for (let k = 0; k < chunk.length; k++) {
+      const i = start + k;
+      // 每 10 个加一点间隔，方便数位置
+      const cls = 'ss-char' + ((i + 1) % 10 === 0 ? ' ss-tick' : '');
+      chars.push(`<span class="${cls}" data-i="${i}">${chunk[k]}</span>`);
+    }
+    parts.push(
+      `<div class="seq-line"><span class="seq-pos">${start + 1}</span>`
+      + `<span class="seq-chars">${chars.join('')}</span></div>`,
+    );
+  }
+  body.innerHTML = parts.join('');
+  state.stripNodes = Array.from(body.querySelectorAll('.ss-char'));
+  state.stripHot = null;
+  applyInvalidToStrip();
+}
+
+/** 把「配对不合法」的碱基在序列条上也标出来 */
+function applyInvalidToStrip() {
+  if (!state.stripNodes) return;
+  const bad = new Set();
+  for (const key of state.invalidPairs) {
+    const [i, j] = key.split(',').map(Number);
+    bad.add(i); bad.add(j);
+  }
+  for (const node of state.stripNodes) {
+    node.classList.toggle('is-bad', bad.has(+node.dataset.i));
+  }
+}
+
+/** 高亮序列条上的某个位置，必要时把它滚进可见区域 */
+function setStripHighlight(i) {
+  if (state.stripHot === i) return;
+  const nodes = state.stripNodes || [];
+  if (state.stripHot != null && nodes[state.stripHot]) {
+    nodes[state.stripHot].classList.remove('is-hot');
+  }
+  state.stripHot = i;
+  if (i == null || !nodes[i]) return;
+  const node = nodes[i];
+  node.classList.add('is-hot');
+
+  // 只在看不见的时候滚动，且只滚序列条自己，避免整页跳动
+  const body = el.stripBody;
+  const nr = node.getBoundingClientRect();
+  const br = body.getBoundingClientRect();
+  if (nr.top < br.top || nr.bottom > br.bottom) {
+    body.scrollTop += (nr.top - br.top) - br.height / 2 + nr.height / 2;
+  }
+}
+
+/** 反向：高亮画布上的某个碱基（鼠标在序列条上移动时用） */
+function setCanvasHighlight(i) {
+  if (state.canvasHot === i) return;
+  const svg = el.canvas;
+  if (state.canvasHot != null) {
+    const prev = svg.querySelector(`.nt[data-i="${state.canvasHot}"]`);
+    if (prev) prev.classList.remove('is-hot');
+  }
+  state.canvasHot = i;
+  if (i == null) return;
+  const node = svg.querySelector(`.nt[data-i="${i}"]`);
+  if (node) node.classList.add('is-hot');
+  state.selection = i;
+}
+
+/* ═══════════════════ 在结构上直接改序列 ═══════════════════ */
+
+// 合法的 Watson-Crick 配对 + G·U 摆动配对
+const CANONICAL_PAIRS = new Set(['AU', 'UA', 'GC', 'CG', 'GU', 'UG']);
+
+/**
+ * 找出因为改碱基而变得不合法的配对。
+ * 不改动结构本身——用户可能是故意造一个错配来试探，标红只是提醒。
+ */
+function computeInvalidPairs() {
+  const bad = new Set();
+  for (const [i, j] of state.pairs) {
+    const a = state.sequence[i], b = state.sequence[j];
+    if (!a || !b) continue;
+    if (!CANONICAL_PAIRS.has(a + b)) bad.add(`${i},${j}`);
+  }
+  return bad;
+}
+
+let baseEditorFor = null;
+
+function openBaseEditor(idx, anchorEl) {
+  baseEditorFor = idx;
+  el.baseEditorPos.textContent = `#${idx + 1}`;
+  el.baseEditorCur.textContent = state.sequence[idx] || '?';
+  el.baseEditor.querySelectorAll('[data-base]').forEach((b) => {
+    b.classList.toggle('is-cur', b.dataset.base === state.sequence[idx]);
+  });
+
+  // 定位到被点的那个碱基旁边
+  const r = anchorEl.getBoundingClientRect();
+  const box = el.baseEditor;
+  box.hidden = false;
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  let left = r.left + r.width / 2 - bw / 2;
+  let top = r.top - bh - 10;
+  if (top < 8) top = r.bottom + 10;                        // 上方放不下就放下方
+  left = Math.max(8, Math.min(left, window.innerWidth - bw - 8));
+  top = Math.max(8, Math.min(top, window.innerHeight - bh - 8));
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+}
+
+function closeBaseEditor() {
+  baseEditorFor = null;
+  el.baseEditor.hidden = true;
+}
+
+/**
+ * 替换某个位置的碱基。
+ *
+ * 刻意不走 syncSequence()：那个函数在发现序列变化时会清空配对和结构，
+ * 而这里要的恰恰是「保留结构，只把不再合法的配对标出来」。
+ */
+function setBase(idx, ch) {
+  const old = state.sequence[idx];
+  if (!old || old === ch) { closeBaseEditor(); return; }
+
+  const arr = state.sequence.split('');
+  arr[idx] = ch;
+  state.sequence = arr.join('');
+
+  el.seq.value = state.sequence;          // 与左侧输入框保持同步
+  el.outSeq.textContent = state.sequence;
+  state.invalidPairs = computeInvalidPairs();
+
+  closeBaseEditor();
+  renderSeqStrip();
+  render();
+  scheduleEvaluate();                      // 序列变了，ΔG 要重算
+  pushHistory(`#${idx + 1} ${old}→${ch}`);
+
+  const n = state.invalidPairs.size;
+  toast(n
+    ? `#${idx + 1} ${old}→${ch}；有 ${n} 对配对因此变得不合法（已标红）`
+    : `#${idx + 1} ${old}→${ch}`);
+}
+
+/* ═══════════════════ 拖动螺旋 / 环调整排版 ═══════════════════ */
+
+/** 把配对按「连续堆叠」切成螺旋段 */
+function computeHelices(pairs) {
+  const sorted = [...pairs].map(([i, j]) => (i < j ? [i, j] : [j, i]))
+    .sort((a, b) => a[0] - b[0]);
+  const runs = [];
+  let run = null;
+  for (const [i, j] of sorted) {
+    const prev = run && run[run.length - 1];
+    if (prev && i === prev[0] + 1 && j === prev[1] - 1) run.push([i, j]);
+    else { run = [[i, j]]; runs.push(run); }
+  }
+  const baseToHelix = new Map();
+  runs.forEach((r, idx) => { for (const [i, j] of r) { baseToHelix.set(i, idx); baseToHelix.set(j, idx); } });
+  return { runs, baseToHelix };
+}
+
+/** 把未配对的连续片段切成环；anchor5/anchor3 是两侧的锚点碱基 */
+function computeLoops(n, pairs) {
+  const paired = new Array(n).fill(false);
+  for (const [i, j] of pairs) { paired[i] = true; paired[j] = true; }
+  const loops = [];
+  let s = null;
+  for (let i = 0; i <= n; i++) {
+    const unpaired = i < n && !paired[i];
+    if (unpaired) { if (s === null) s = i; }
+    else if (s !== null) { loops.push({ start: s, end: i - 1, bases: [] }); s = null; }
+  }
+  for (const L of loops) {
+    for (let b = L.start; b <= L.end; b++) L.bases.push(b);
+    L.anchor5 = (L.start - 1 >= 0 && paired[L.start - 1]) ? L.start - 1 : null;
+    L.anchor3 = (L.end + 1 < n && paired[L.end + 1]) ? L.end + 1 : null;
+  }
+  return loops;
+}
+
+/**
+ * 把环上的碱基重新铺在两个锚点之间，向外鼓成一段圆弧。
+ *
+ * 用二次贝塞尔而不是真圆弧：端点、切线都对，公式简单，也不会出现
+ * 圆心角接近 180° 时的数值退化。移动螺旋后靠它把环「抻」开。
+ */
+function relayoutLoop(L, pts, centroid, spacing) {
+  const m = L.bases.length;
+  if (!m || L.anchor5 == null || L.anchor3 == null) return;
+  const pa = pts[L.anchor5], pb = pts[L.anchor3];
+  const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
+  let dx = pb.x - pa.x, dy = pb.y - pa.y;
+  const chord = Math.hypot(dx, dy) || 1e-6;
+  let nx = -dy / chord, ny = dx / chord;
+  // 朝背离结构中心的一侧鼓出去，这样环不会叠到螺旋上
+  if ((mx - centroid.x) * nx + (my - centroid.y) * ny < 0) { nx = -nx; ny = -ny; }
+
+  // 鼓出幅度只由「环里有几个碱基」决定，跟两端被拉开多远无关。
+  // 早先版本带了一项 chord*0.3，结果把螺旋拖远时，只有一两个碱基的
+  // 连接环会被推出去老远、拉出一条长线——看着像画坏了。
+  // 上限 chord*1.2 只是防止环特别大时鼓成一个圈。
+  const bulge = Math.min(m * spacing * 0.45, chord * 1.2);
+  const cx = mx + nx * 2 * bulge, cy = my + ny * 2 * bulge;
+
+  for (let k = 0; k < m; k++) {
+    const t = (k + 1) / (m + 1);
+    const u = 1 - t;
+    pts[L.bases[k]].x = u * u * pa.x + 2 * u * t * cx + t * t * pb.x;
+    pts[L.bases[k]].y = u * u * pa.y + 2 * u * t * cy + t * t * pb.y;
+  }
+}
+
+/** 把某个碱基所在的「单位」（螺旋或环）平移 (dx, dy) */
+/** 相邻碱基间距的中位数——不同布局的坐标尺度差很多，用它来定环的鼓出幅度 */
+function typicalSpacing(pts, n) {
+  const gaps = [];
+  for (let i = 0; i < n - 1; i++) {
+    gaps.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
+  }
+  gaps.sort((a, b) => a - b);
+  return gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1;
+}
+
+function moveUnit(baseIdx, dx, dy) {
+  const pts = state.manualPoints;
+  const n = state.sequence.length;
+  const spacing = typicalSpacing(pts, n);
+  const { baseToHelix } = computeHelices(state.pairs);
+  const hid = baseToHelix.get(baseIdx);
+
+  if (hid != null) {
+    const moving = new Set();
+    for (const [i, j] of state.pairs) {
+      if (baseToHelix.get(i) === hid) { moving.add(i); moving.add(j); }
+    }
+    for (const b of moving) { pts[b].x += dx; pts[b].y += dy; }
+    // 与这段螺旋相连的环要跟着变形
+    let cx = 0, cy = 0;
+    for (const p of pts) { cx += p.x; cy += p.y; }
+    const centroid = { x: cx / n, y: cy / n };
+    for (const L of computeLoops(n, state.pairs)) {
+      if ((L.anchor5 != null && moving.has(L.anchor5))
+          || (L.anchor3 != null && moving.has(L.anchor3))) {
+        relayoutLoop(L, pts, centroid, spacing);
+      }
+    }
+  } else {
+    // 未配对：整个环一起平移
+    const L = computeLoops(n, state.pairs).find((l) => l.bases.includes(baseIdx));
+    if (L) for (const b of L.bases) { pts[b].x += dx; pts[b].y += dy; }
+  }
+}
+
+function refreshManualBounds() {
+  const pts = state.manualPoints;
+  if (!pts || !pts.length) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const span = Math.max(maxX - minX, maxY - minY, 1e-6);
+  state.result.layout = {
+    ...state.result.layout,
+    points: state.manualPoints,
+    bounds: { minX, minY, maxX, maxY, span },
+  };
+}
+
+function setArrange(on) {
+  state.arrange = !!on;
+  el.btnArrange.classList.toggle('is-on', state.arrange);
+  el.btnArrange.setAttribute('aria-pressed', String(state.arrange));
+  el.arrangeBanner.hidden = !state.arrange;
+  el.canvasScroll.classList.toggle('is-arranging', state.arrange);
+  if (state.arrange) {
+    // 进入排版模式时先固化当前坐标，之后拖的是这一份
+    if (!state.manualPoints && state.result && state.result.layout) {
+      state.manualPoints = state.result.layout.points.map((p) => ({ ...p }));
+    }
+    toast('调整排版：拖动螺旋可移动它，相连的环会跟着变形');
+  }
+}
+
+function restoreAutoLayout() {
+  if (!state.manualPoints) { toast('当前就是自动布局'); return; }
+  state.manualPoints = null;
+  state.fitPending = true;
+  void rerender();
+  pushHistory('恢复自动布局');
+  toast('已恢复自动布局');
+}
+
 /* ─────────────────────────── 启动 ─────────────────────────── */
 
 async function init() {
@@ -2828,6 +3274,7 @@ async function init() {
   renderHistory();
   updateHistoryButtons();
   renderDomains();
+  renderSeqStrip();
 
   // 关闭/刷新前补存一次，免得最后一步改动没落盘
   window.addEventListener('beforeunload', () => {

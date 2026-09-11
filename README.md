@@ -10,8 +10,8 @@
 
 | 你的系统 | 安装包 | 打开方式 |
 |---|---|---|
-| macOS（Apple Silicon） | [RNA-Studio-0.0.2-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.2/RNA-Studio-0.0.2-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | [RNA-Studio-0.0.2-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.2/RNA-Studio-0.0.2-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+| macOS（Apple Silicon） | [RNA-Studio-0.0.3-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.3/RNA-Studio-0.0.3-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-0.0.3-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.3/RNA-Studio-0.0.3-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
 
 全部版本见 [Releases](../../releases)。
 
@@ -135,6 +135,26 @@ python desktop.py        # 以原生窗口方式启动（需先装 requirements-
 「按结构域分段折叠」会把每个域单独折叠、拼回整体再评估，用来判断
 **结构域能否独立折叠**：如果各段能量之和与整体接近，说明域间耦合弱；
 差得多则提示域间存在相互作用。
+
+### 序列条与改序列
+
+结构图上方有一条线性序列条，与结构图**双向联动**：鼠标在结构上划过某个碱基，
+序列条对应位置会高亮并自动滚入视野；鼠标在序列条上划过，结构上对应的碱基也会亮起来。
+长链上靠这个定位比在图上找快得多。
+
+**双击**结构上或序列条上的任意碱基，会弹出 A/U/G/C 选择器直接替换。
+改完会立刻检查所有配对是否仍然合法（A–U、G–C、G–U），
+不再合法的配对标红提示——但**不会自动解除**，你可能只是想试试这个错配。
+
+### 拖动排版
+
+点工具栏的「调整排版」进入排版模式，拖动任意碱基会**整体移动它所在的螺旋**，
+与之相连的环会平滑地跟着变形——用来把叠在一起的茎错开、把结构排得整齐。
+
+以螺旋为单位而不是单个碱基，是因为拖单个碱基很容易把骨架扯成一团；
+整段移动才真的能整理排版。未配对的碱基则拖动它所在的整个环。
+
+排版结果会保留并随图导出，随时可以点「恢复自动布局」还原。
 
 ### 序列定位
 

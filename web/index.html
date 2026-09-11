@@ -334,12 +334,31 @@
                   aria-pressed="false" title="只读预览：锁定画布，避免查看结构时误改配对">只读</button>
           <button class="tool tool-toggle" id="btn-compare" type="button"
                   aria-pressed="false" title="对照预览：当前结构与 MFE 结构并排比较">对照 MFE</button>
+          <button class="tool tool-toggle" id="btn-arrange" type="button"
+                  aria-pressed="false" title="调整排版：拖动碱基可整体移动它所在的螺旋，相连的环会跟着变形">调整排版</button>
         </div>
         <div class="legend" id="legend"></div>
       </div>
 
+      <!-- 序列条：与结构图双向联动，也可直接双击改碱基 -->
+      <div class="seq-strip" id="seq-strip">
+        <div class="seq-strip-head">
+          <span class="seq-strip-title">序列</span>
+          <span class="seq-strip-hint" id="seq-strip-hint">
+            鼠标悬停与结构联动 · 双击碱基可直接改
+          </span>
+          <button class="link-btn" id="btn-strip-toggle" type="button">收起</button>
+        </div>
+        <div class="seq-strip-body" id="seq-strip-body"></div>
+      </div>
+
       <div class="readonly-banner" id="readonly-banner" hidden>
         只读预览中 — 画布已锁定，点击不会修改配对。再点一次「只读」即可继续编辑。
+      </div>
+
+      <div class="arrange-banner" id="arrange-banner" hidden>
+        调整排版中 — 拖动螺旋可移动它，相连的环会跟着变形；拖动空白处仍是平移画布。
+        <button class="link-btn" id="btn-restore-layout" type="button">恢复自动布局</button>
       </div>
       <div class="canvas-scroll" id="canvas-scroll">
         <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
@@ -422,6 +441,13 @@
     </div>
   </form>
 </dialog>
+
+<!-- 碱基编辑弹窗：双击结构上或序列条上的碱基时出现 -->
+<div class="base-editor" id="base-editor" hidden>
+  <span class="base-editor-pos" id="base-editor-pos"></span>
+  <span class="base-editor-cur" id="base-editor-cur"></span>
+  <div class="base-editor-btns" id="base-editor-btns"></div>
+</div>
 
 <div id="toast" class="toast" hidden></div>
 <div id="busy" class="busy" hidden><span class="spinner"></span><span id="busy-text">计算中…</span></div>
