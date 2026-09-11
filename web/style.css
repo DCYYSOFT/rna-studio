@@ -826,6 +826,68 @@ textarea:focus, input:focus, select:focus {
 /* 点阵图模式下画布不需要手型光标 */
 #canvas image { image-rendering: pixelated; }
 
+/* ══════════════════ PDB 导入 ══════════════════ */
+
+.pdb-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 18px;
+  margin-bottom: 14px;
+  border: 1.5px dashed var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  transition: border-color .12s, background .12s;
+}
+.pdb-drop.is-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.pdb-drop-hint { font-size: 12px; color: var(--muted-solid); }
+
+.pdb-fileline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.pdb-filename {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pdb-opts { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; }
+.pdb-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.pdb-opt input { flex: 0 0 auto; margin: 0; }
+
+/* 导入结果摘要 */
+.pdb-summary {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.pdb-summary b { font-family: var(--mono); }
+.pdb-summary .k { color: var(--muted-solid); }
+.pdb-summary .warn { color: var(--danger); }
+
 /* ══════════════════ 序列条 ══════════════════ */
 
 .seq-strip {
@@ -915,8 +977,12 @@ textarea:focus, input:focus, select:focus {
 .canvas-scroll.is-arranging #canvas .nt-circle { cursor: move; }
 .canvas-scroll.is-arranging #canvas .nt-circle:hover { stroke-width: calc(var(--u) * 0.9); }
 
-/* 改碱基后不再合法的配对：标红 + 虚线，与假结的样式区分开 */
-.bp-line.is-invalid { stroke: var(--danger); stroke-dasharray: calc(var(--u) * 0.8) calc(var(--u) * 0.6); }
+/* 非经典配对（PDB 导入的天然非经典配对，或改碱基后变得不合法的配对）。
+   用紫色 + 点线，与假结（红虚线）和对照差异（琥珀实线）都区分得开。 */
+.bp-line.is-noncanon {
+  stroke: #7B5EA7;
+  stroke-dasharray: calc(var(--u) * 0.45) calc(var(--u) * 0.5);
+}
 
 /* ══════════════════ 碱基编辑弹窗 ══════════════════ */
 
@@ -1139,3 +1205,31 @@ textarea:focus, input:focus, select:focus {
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ══════════════════ 配体结合位点 ══════════════════ */
+
+.binding-list { border: 1px solid var(--line-soft); border-radius: var(--radius); }
+.binding-list .empty { margin: 0; padding: 10px 12px; font-size: 12px; color: var(--muted-solid); }
+
+.bind-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.bind-row:last-child { border-bottom: none; }
+.bind-swatch { flex: 0 0 auto; width: 11px; height: 11px; border-radius: 50%; }
+.bind-name { flex: 1 1 auto; font-weight: 600; }
+.bind-kind {
+  font-weight: 400;
+  font-size: 10.5px;
+  color: var(--muted-solid);
+  margin-left: 5px;
+}
+.bind-range { flex: 0 0 auto; font-family: var(--mono); font-size: 10.5px; color: var(--ink-soft); }
+.bind-count { flex: 0 0 auto; font-family: var(--mono); font-size: 10.5px; color: var(--muted-solid); }
+
+/* 结合位点碱基的外圈 */
+.nt-ring { pointer-events: none; }

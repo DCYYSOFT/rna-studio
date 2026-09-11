@@ -69,8 +69,8 @@ gh auth login
 想让它自动挂到 Releases 上（方便直接分享链接），打个 tag 推上去：
 
 ```bash
-git tag v0.0.3
-git push origin v0.0.3
+git tag v0.0.4
+git push origin v0.0.4
 ```
 
 构建完成后会自动创建同名 Release，并把两个安装包作为附件挂上去。
@@ -111,7 +111,7 @@ cd rna-studio
 ./packaging/build_macos.sh
 ```
 
-产物：`dist/RNA Studio.app` 和 `release/RNA-Studio-0.0.3-macOS-arm64.dmg`
+产物：`dist/RNA Studio.app` 和 `release/RNA-Studio-0.0.4-macOS-arm64.dmg`
 
 脚本会自己建虚拟环境、装依赖、生成精简 JRE、打包、ad-hoc 签名、做 DMG。
 没装 JDK 也能跑完，只是不带 JRE（VARNA 出图会去找系统 Java）。
@@ -127,7 +127,7 @@ cd rna-studio
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-产物：`dist\RNA Studio\RNA Studio.exe` 和 `release\RNA-Studio-0.0.3-Windows-x64.zip`
+产物：`dist\RNA Studio\RNA Studio.exe` 和 `release\RNA-Studio-0.0.4-Windows-x64.zip`
 
 ---
 

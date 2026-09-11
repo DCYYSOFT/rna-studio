@@ -10,8 +10,8 @@
 
 | 你的系统 | 安装包 | 打开方式 |
 |---|---|---|
-| macOS（Apple Silicon） | [RNA-Studio-0.0.3-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.3/RNA-Studio-0.0.3-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | [RNA-Studio-0.0.3-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.3/RNA-Studio-0.0.3-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+| macOS（Apple Silicon） | [RNA-Studio-0.0.4-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.4/RNA-Studio-0.0.4-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-0.0.4-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.4/RNA-Studio-0.0.4-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
 
 全部版本见 [Releases](../../releases)。
 
@@ -135,6 +135,29 @@ python desktop.py        # 以原生窗口方式启动（需先装 requirements-
 「按结构域分段折叠」会把每个域单独折叠、拼回整体再评估，用来判断
 **结构域能否独立折叠**：如果各段能量之和与整体接近，说明域间耦合弱；
 差得多则提示域间存在相互作用。
+
+### 从 PDB / mmCIF 导入
+
+左栏「从 PDB 导入」可以直接读三维结构文件，**按氢键几何判定碱基配对**，
+得到实验测定的二级结构——而不是拿序列重新预测一遍（那样等于把结构信息丢掉）。
+
+- 支持 `.pdb` 与 `.cif` / `.mmcif` 两种格式
+- **修饰核苷酸自动归一到母体**（2MG→G、PSU→U、5MC→C…），
+  用的是「看它带哪些特征原子」的办法，所以任何没见过的修饰都能处理
+- 水分子的离子会被跳过；**配体（含金属离子）单独识别**，
+  并列出它接触到的碱基——核糖开关研究里最关心的就是这个
+- 多条 RNA 链时让你选一条；晶体结构常见的**未解析区域**会用灰带标出，
+  提醒你哪些段是缺口而非实验测定的单链
+- **参考序列**：晶体结构常有残基没解析出来导致后面编号错位。
+  填上完整序列可以把配对映射回完整长度（不填就用 PDB 里抽出的序列）
+- 默认**保留假结**（红虚线标出）；想算 ΔG 可勾选「去掉假结」得到嵌套结构
+- 非经典配对标成紫色点线
+
+实测 34 个结构（tRNA、各类核糖开关、核酶、群 I 内含子、端粒酶 RNA、
+23S/16S rRNA、50S/30S 核糖体亚基），全部正确解析，最慢 1.9 秒。
+
+> 说明：点括号只有 4 种括号，假结交叉层次超过 4 层时会有配对被省略，
+> 程序会**明确告知省略了几对**，不会悄悄少。
 
 ### 序列条与改序列
 

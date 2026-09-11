@@ -205,6 +205,20 @@
     </section>
 
     <section class="block">
+      <h2 class="block-title">从 PDB 导入</h2>
+      <p class="block-hint">
+        读取三维结构文件（PDB / mmCIF），直接看哪些碱基在空间上真的形成了氢键，
+        得到<strong>实验测定</strong>的二级结构——而不是拿序列重新预测一遍。
+        结果可以继续手工编辑，也能与 MFE 预测对照。
+      </p>
+      <div class="btn-row">
+        <button id="btn-pdb-open" class="btn" type="button">打开 PDB / mmCIF 文件…</button>
+      </div>
+      <div class="readouts readouts-tight" style="margin-top:12px">配体结合位点</div>
+      <div id="binding-list" class="binding-list"></div>
+    </section>
+
+    <section class="block">
       <h2 class="block-title">出图</h2>
       <p class="block-hint">
         下面两项设置对画布显示和两种出图都生效。导图会先弹出预览，确认后再保存。
@@ -448,6 +462,76 @@
   <span class="base-editor-cur" id="base-editor-cur"></span>
   <div class="base-editor-btns" id="base-editor-btns"></div>
 </div>
+
+<!-- PDB 导入 -->
+<dialog id="pdb-dialog" class="dialog dialog-wide">
+  <div class="dialog-form">
+    <h2 class="dialog-title">从 PDB / mmCIF 导入</h2>
+    <p class="dialog-sub">
+      按氢键几何判定碱基配对。修饰核苷酸会自动归一到母体，水和离子会被跳过。
+    </p>
+
+    <div id="pdb-step-file">
+      <div class="pdb-drop" id="pdb-drop">
+        <input type="file" id="pdb-file" accept=".pdb,.ent,.cif,.mmcif,.txt" hidden>
+        <button class="btn btn-primary" id="pdb-choose" type="button">选择文件…</button>
+        <span class="pdb-drop-hint">或把文件拖到这里</span>
+      </div>
+      <label class="field">
+        <span class="field-label">也可以直接粘贴内容</span>
+        <textarea id="pdb-text" rows="4" spellcheck="false"
+                  placeholder="粘贴 PDB 或 mmCIF 文本…"></textarea>
+      </label>
+      <div class="btn-row">
+        <button class="btn" id="pdb-read" type="button">读取</button>
+      </div>
+    </div>
+
+    <div id="pdb-step-chain" hidden>
+      <div class="pdb-fileline">
+        <span id="pdb-filename" class="pdb-filename"></span>
+        <button class="link-btn" id="pdb-restart" type="button">换个文件</button>
+      </div>
+
+      <label class="field">
+        <span class="field-label">选择链</span>
+        <select id="pdb-chain"></select>
+        <span class="field-hint" id="pdb-chain-hint"></span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">参考序列（可选）</span>
+        <textarea id="pdb-reference" rows="3" spellcheck="false"
+                  placeholder="留空则直接用 PDB 里抽出的序列"></textarea>
+        <span class="field-hint" id="pdb-ref-hint">
+          晶体结构常有残基没解析出来，导致后面编号错位。填上完整序列可以把配对映射回去。
+        </span>
+      </label>
+
+      <div class="pdb-opts">
+        <label class="pdb-opt">
+          <input type="checkbox" id="pdb-noncanon" checked>
+          <span>包含非经典配对（A–G、U–U 等）</span>
+        </label>
+        <label class="pdb-opt">
+          <input type="checkbox" id="pdb-nested">
+          <span>去掉假结（强制嵌套，可算 ΔG）</span>
+        </label>
+        <label class="pdb-opt">
+          <input type="checkbox" id="pdb-setseq" checked>
+          <span>同时把序列载入主界面</span>
+        </label>
+      </div>
+    </div>
+
+    <div id="pdb-summary" class="pdb-summary" hidden></div>
+    <p class="dialog-error" id="pdb-error" hidden></p>
+    <div class="dialog-actions">
+      <button class="btn btn-quiet" id="pdb-cancel" type="button">取消</button>
+      <button class="btn btn-primary" id="pdb-import" type="button" disabled>导入</button>
+    </div>
+  </div>
+</dialog>
 
 <div id="toast" class="toast" hidden></div>
 <div id="busy" class="busy" hidden><span class="spinner"></span><span id="busy-text">计算中…</span></div>

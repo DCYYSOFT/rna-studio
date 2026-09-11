@@ -127,35 +127,32 @@ def parse(dotbracket: str, sequence: str, *, allow_pseudoknot: bool = True) -> P
 
 
 def pairs_to_dotbracket(n: int, pairs: Iterable[tuple[int, int]]) -> str:
-    """把配对列表转成纯 '.'/'()' 的点括号串。交叉配对自动改用不同括号类型。"""
+    """把配对列表转成点括号串。交叉配对自动改用不同括号类型（假结）。
+
+    实现上为每种括号类型维护一组「尚未闭合的配对终点」。
+    新配对 (i,j) 与同类型的已有配对交叉，当且仅当有某个尚未闭合的终点 b
+    落在区间 (i, j) 内——也就是「它在这一段里闭合了」。被完全包住的
+    （b > j）不算冲突，那是正常嵌套。
+
+    早先的写法每放一个配对就把整个数组重扫一遍找同类型配对，
+    976 个配对的 rRNA 上要跑上千万次循环，实测占了大头。
+    """
     out = ["."] * n
-    used = set()
-    for i, j in sorted(pairs, key=lambda p: p[1] - p[0]):
-        if i in used or j in used:
+    open_ends: dict[str, list[int]] = {o: [] for o in OPEN}
+
+    for i, j in sorted((p[0], p[1]) for p in pairs):
+        if not (0 <= i < j < n):
             continue
-        # 选一个不与已有括号类型冲突的括号类型
         for o, c in zip(OPEN, CLOSE):
-            conflict = False
-            for a, b in _existing_pairs(out, o, c):
-                if not (j < a or i > b or (i < a and j > b) or (a < i and b > j)):
-                    conflict = True
-                    break
-            if not conflict:
-                out[i], out[j] = o, c
-                used.update((i, j))
-                break
+            # 只保留在 i 处仍然打开的配对（终点在 i 之后）
+            ends = [b for b in open_ends[o] if b > i]
+            if any(i < b < j for b in ends):
+                continue                     # 有配对在这一段内闭合 → 交叉，换一种括号
+            out[i], out[j] = o, c
+            open_ends[o] = ends + [j]
+            break
+
     return "".join(out)
-
-
-def _existing_pairs(buf: list[str], o: str, c: str):
-    st = []
-    res = []
-    for idx, ch in enumerate(buf):
-        if ch == o:
-            st.append(idx)
-        elif ch == c and st:
-            res.append((st.pop(), idx))
-    return res
 
 
 def canonical(dotbracket: str) -> str:

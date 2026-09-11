@@ -36,9 +36,11 @@ const state = {
   readOnly: false,          // 只读预览：画布锁定，点击不修改配对
   domains: [],              // 结构域标注 [{name, start, end, color}]，0-based 闭区间
   locatedRange: null,       // 序列定位的高亮区间 [start, end]
+  pdbGaps: [],              // PDB 未解析出的区域 [[start,end],...]，用灰带标出
+  bindingSites: [],         // 配体结合位点 [{name, color, positions:[i,...]}]
   lastRenderedPoints: null, // 上一次真正画出来的坐标，用于折叠过渡动画
   lastRenderedPairs: [],
-  invalidPairs: new Set(),  // 因改碱基而变得不合法的配对（标红提示，但不自动解除）
+  invalidPairs: new Set(),  // 非经典配对（PDB 导入或改碱基所致），标紫提示但不自动解除
   manualPoints: null,       // 手动拖动后的坐标；null 表示用后端给的自动布局
   arrange: false,           // 「调整排版」模式：拖动移动螺旋而不是平移画布
   stripNodes: [],           // 序列条的字符节点缓存，按索引取用
@@ -79,6 +81,16 @@ const el = {
   historyList: $('history-list'),
   locateInput: $('locate-input'), btnLocate: $('btn-locate'),
   bpStyleDraw: $('bp-style-draw'),
+  btnPdbOpen: $('btn-pdb-open'), pdbDialog: $('pdb-dialog'),
+  pdbStepFile: $('pdb-step-file'), pdbStepChain: $('pdb-step-chain'),
+  pdbDrop: $('pdb-drop'), pdbFile: $('pdb-file'), pdbChoose: $('pdb-choose'),
+  pdbText: $('pdb-text'), pdbRead: $('pdb-read'), pdbRestart: $('pdb-restart'),
+  pdbFilename: $('pdb-filename'), pdbChain: $('pdb-chain'), pdbChainHint: $('pdb-chain-hint'),
+  pdbReference: $('pdb-reference'), pdbRefHint: $('pdb-ref-hint'),
+  pdbNoncanon: $('pdb-noncanon'), pdbNested: $('pdb-nested'), pdbSetseq: $('pdb-setseq'),
+  pdbSummary: $('pdb-summary'), pdbError: $('pdb-error'),
+  pdbCancel: $('pdb-cancel'), pdbImport: $('pdb-import'),
+  bindingList: $('binding-list'),
   stripBody: $('seq-strip-body'), stripHint: $('seq-strip-hint'),
   btnStripToggle: $('btn-strip-toggle'), seqStrip: $('seq-strip'),
   btnArrange: $('btn-arrange'), arrangeBanner: $('arrange-banner'),
@@ -263,6 +275,7 @@ function syncSequence() {
     state.lastRenderedPoints = null;   // 换了序列，谈不上「过渡」
     state.domains = [];
     state.locatedRange = null;
+    state.pdbGaps = [];
     state.history = [];          // 换了序列，旧的历史没有意义
     state.historyIndex = -1;
     renderHistory();
@@ -278,10 +291,13 @@ function syncSequence() {
     el.decomp.innerHTML = '<p class="empty">折叠或评估后显示逐环能量。</p>';
     clearMessages();
   }
+  // 注意：这一行必须在 if (changed) 里面。放到外面的话，每次 doEvaluate 调
+  // syncSequence 都会把非经典配对的标注清掉——导入 PDB 时刚标好的紫色就没了。
+  if (changed) state.invalidPairs = new Set();
+
   syncConstraintReadouts();
   el.statModeWrap.hidden = state.mode === 'cofold';
   renderSeqStrip();
-  state.invalidPairs = new Set();
 }
 
 /* ────────────────────────────── 渲染 ────────────────────────────── */
@@ -425,7 +441,7 @@ function drawStructure(svgEl, ctx) {
     sequence, layout, pairs = [], breaks = [], forbidden = new Set(),
     selected = null, colorMap = null, period = 0, diffPairs = null,
     bands = [], interactive = true, colorRamp = null, bpStyle = '',
-    invalidPairs = null,
+    invalidPairs = null, pkPairs = null, bindingSites = null,
   } = ctx;
 
   const n = sequence.length;
@@ -522,10 +538,14 @@ function drawStructure(svgEl, ctx) {
     if (i >= pts.length || j >= pts.length) continue;
     const inSel = selected != null && (i === selected || j === selected);
     const isDiff = diffPairs ? diffPairs.has(`${i},${j}`) : false;
-    // 改碱基后不再合法的配对标红：只提示，不自动解除
+    // 非经典配对：既包括从 PDB 导入的天然非经典配对，也包括改碱基后
+    // 变得不合法的配对。只做标注，不自动解除。
     const isBad = invalidPairs ? invalidPairs.has(`${i},${j}`) || invalidPairs.has(`${j},${i}`) : false;
-    const cls = 'bp-line' + (isDiff ? ' is-diff' : '')
-      + (isBad ? ' is-invalid' : '') + (inSel ? ' is-sel' : '');
+    // 假结（交叉配对）用红虚线单独标出。这一段在早先重构 drawStructure 时被漏掉了，
+    // 结果假结在图上和普通配对长得一样、看不出来，属于回归。
+    const isPk = pkPairs ? pkPairs.has(`${i},${j}`) || pkPairs.has(`${j},${i}`) : false;
+    const cls = 'bp-line' + (isDiff ? ' is-diff' : '') + (isPk ? ' is-pk' : '')
+      + (isBad ? ' is-noncanon' : '') + (inSel ? ' is-sel' : '');
 
     // 梯形画法：每对画成一小段横杠，视觉上像螺旋的梯级
     if (bpStyle === 'ladder') {
@@ -575,6 +595,16 @@ function drawStructure(svgEl, ctx) {
     else if (selPartner === i) g.classList.add('is-partnered');
     if (forbidden.has(i)) g.classList.add('is-forbidden');
     if (!interactive) g.classList.add('is-static');
+
+    // 配体结合位点：在碱基外面再套一圈，表示「这个碱基和配体有接触」
+    const siteColor = bindingSites ? bindingSites.get(i) : null;
+    if (siteColor) {
+      g.appendChild(mk('circle', {
+        class: 'nt-ring', cx: p.x, cy: p.y, r: r * 1.42,
+        fill: 'none', stroke: siteColor,
+        'stroke-width': r * 0.30, opacity: 0.75,
+      }));
+    }
 
     const rgb = colorMap ? (colorRamp || colorForValue)(colorMap[i]) : null;
     g.appendChild(mk('circle', {
@@ -680,6 +710,27 @@ function drawStructure(svgEl, ctx) {
   return { vb, r };
 }
 
+/** 碱基索引 → 结合位点颜色，供绘图时套外圈 */
+function bindingSiteMap() {
+  const m = new Map();
+  for (const s of state.bindingSites) {
+    for (const i of s.positions) m.set(i, s.color);
+  }
+  return m;
+}
+
+/** 把交叉配对展开成 'i,j' 集合，供绘图时标红 */
+function pseudoKnotPairSet() {
+  const s = new Set();
+  const cp = state.result && state.result.crossing_pairs;
+  if (!cp) return s;
+  for (const [a, b] of cp) {
+    s.add(`${a[0]},${a[1]}`); s.add(`${b[0]},${b[1]}`);
+    s.add(`${a[1]},${a[0]}`); s.add(`${b[1]},${b[0]}`);
+  }
+  return s;
+}
+
 /** 主画布渲染 */
 function render() {
   const n = state.sequence.length;
@@ -719,6 +770,8 @@ function render() {
     colorRamp: state.colorMode === 'rainbow' ? rainbowColor : null,
     bpStyle: el.bpStyleDraw ? el.bpStyleDraw.value : '',
     invalidPairs: state.invalidPairs,
+    pkPairs: pseudoKnotPairSet(),
+    bindingSites: bindingSiteMap(),
   });
 
   if (!geo) return;
@@ -1054,7 +1107,14 @@ function adoptResult(data, { keepSelection = false } = {}) {
   state.manualPoints = null;
   const parsed = parseStructure(data.structure);
   state.pairs = parsed.pairs.map((p) => [p[0], p[1]]);
-  state.invalidPairs = computeInvalidPairs();
+  // 非经典配对由谁判定：从 PDB 导入时用后端基于**氢键几何**的结果
+  // （能识别 Hoogsteen 边之类「字母看着经典、几何其实不是」的配对）；
+  // 其余情况用前端的字母判定。这里用一个只生效一次的开关来区分。
+  if (preserveNonCanonOnce) {
+    preserveNonCanonOnce = false;
+  } else {
+    state.invalidPairs = computeInvalidPairs();
+  }
   state.breaks = data.layout ? (data.layout.breaks || []) : [];
 
   state.probMap.clear();
@@ -1612,6 +1672,43 @@ function bindEvents() {
   el.btnArrange.addEventListener('click', () => setArrange(!state.arrange));
   el.btnRestoreLayout.addEventListener('click', restoreAutoLayout);
 
+  // ── 从 PDB 导入 ──
+  el.btnPdbOpen.addEventListener('click', openPdbDialog);
+  el.pdbChoose.addEventListener('click', () => el.pdbFile.click());
+  el.pdbFile.addEventListener('change', () => {
+    if (el.pdbFile.files && el.pdbFile.files[0]) void pdbReadFile(el.pdbFile.files[0]);
+  });
+  el.pdbRead.addEventListener('click', () => { void pdbLoadChains(); });
+  el.pdbRestart.addEventListener('click', () => {
+    pdbText = '';
+    el.pdbFile.value = '';
+    el.pdbFilename.textContent = '';
+    el.pdbStepFile.hidden = false;
+    el.pdbStepChain.hidden = true;
+    el.pdbSummary.hidden = true;
+    el.pdbImport.disabled = true;
+  });
+  el.pdbChain.addEventListener('change', () => { void pdbRefreshPreview(); });
+  el.pdbReference.addEventListener('change', () => { void pdbRefreshPreview(); });
+  el.pdbNoncanon.addEventListener('change', () => { void pdbRefreshPreview(); });
+  el.pdbNested.addEventListener('change', () => { void pdbRefreshPreview(); });
+  el.pdbImport.addEventListener('click', () => { void pdbDoImport(); });
+  el.pdbCancel.addEventListener('click', () => el.pdbDialog.close());
+
+  // 拖放
+  ['dragenter', 'dragover'].forEach((ev) => el.pdbDrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    el.pdbDrop.classList.add('is-over');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => el.pdbDrop.addEventListener(ev, (e) => {
+    e.preventDefault();
+    el.pdbDrop.classList.remove('is-over');
+  }));
+  el.pdbDrop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) void pdbReadFile(f);
+  });
+
   // ── 结构域标注 ──
   el.btnDomainAdd.addEventListener('click', addDomain);
   el.btnDomainFromRange.addEventListener('click', fillRangeFromLocated);
@@ -2161,6 +2258,11 @@ function activeBands() {
       label: null,
     });
   }
+  // PDB 里没解析出来的残基：它们在结构上是自由单链，但要让人一眼看出
+  // 「这段是缺口、不是实验测定到的单链」。
+  for (const [s, e] of state.pdbGaps) {
+    bands.push({ start: s, end: e, color: '#B8C0CC', label: '未解析' });
+  }
   return bands;
 }
 
@@ -2211,6 +2313,9 @@ async function showPseudoknot(crossings, structure) {
       state.result.energy = null;
       state.result.infeasible = false;
       state.result.has_pseudoknot = true;
+      // 假结这一支走的是 /api/layout，拿不到后端算的 crossing_pairs，
+      // 必须用本地检出的结果补上，否则图上画不出假结的红虚线。
+      state.result.crossing_pairs = crossings.map(([a, b]) => [a, b]);
       state.result.mfe_energy = state.result.mfe_energy ?? null;
     }
     state.fitPending = false;    // 保留用户当前视角，避免每次编辑都跳回适应窗口
@@ -3091,6 +3196,41 @@ function setBase(idx, ch) {
     : `#${idx + 1} ${old}→${ch}`);
 }
 
+/* ═══════════════════ 配体结合位点 ═══════════════════ */
+
+function renderBindingSites() {
+  const box = el.bindingList;
+  if (!box) return;
+  if (!state.bindingSites.length) {
+    box.innerHTML = '<p class="empty">从 PDB 导入后，这里会列出配体及其接触的碱基。</p>';
+    return;
+  }
+  box.innerHTML = state.bindingSites.map((s, k) => {
+    const ranges = toRanges(s.positions);
+    return `<div class="bind-row" data-idx="${k}">`
+      + `<span class="bind-swatch" style="background:${s.color}"></span>`
+      + `<span class="bind-name">${escapeHtml(s.name)}`
+      + `<span class="bind-kind">${s.isIon ? '离子' : '配体'}</span></span>`
+      + `<span class="bind-range">${ranges}</span>`
+      + `<span class="bind-count">${s.positions.length} nt</span>`
+      + `</div>`;
+  }).join('');
+}
+
+/** 把零散的位置压成 #12–#15 这样的区间串，太长就省略 */
+function toRanges(sorted) {
+  if (!sorted.length) return '—';
+  const ps = [...sorted].sort((a, b) => a - b);
+  const out = [];
+  let s = ps[0], p = ps[0];
+  for (const q of ps.slice(1)) {
+    if (q === p + 1) p = q;
+    else { out.push(s === p ? `#${s + 1}` : `#${s + 1}–#${p + 1}`); s = p = q; }
+  }
+  out.push(s === p ? `#${s + 1}` : `#${s + 1}–#${p + 1}`);
+  return out.slice(0, 4).join('、') + (out.length > 4 ? ` 等 ${out.length} 段` : '');
+}
+
 /* ═══════════════════ 拖动螺旋 / 环调整排版 ═══════════════════ */
 
 /** 把配对按「连续堆叠」切成螺旋段 */
@@ -3243,6 +3383,216 @@ function restoreAutoLayout() {
   toast('已恢复自动布局');
 }
 
+/* ═══════════════════ 从 PDB / mmCIF 导入 ═══════════════════ */
+
+// 从 PDB 导入时置位，让 adoptResult 跳过基于字母的重新判定（见 adoptResult 里的说明）
+let preserveNonCanonOnce = false;
+
+let pdbText = '';
+let pdbChains = [];
+let pdbPreview = null;      // 当前选项下的预览结果
+
+function openPdbDialog() {
+  pdbText = '';
+  pdbChains = [];
+  pdbPreview = null;
+  el.pdbText.value = '';
+  el.pdbFile.value = '';
+  el.pdbError.hidden = true;
+  el.pdbSummary.hidden = true;
+  el.pdbStepFile.hidden = false;
+  el.pdbStepChain.hidden = true;
+  el.pdbImport.disabled = true;
+  // 参考序列默认留空。早先版本会自动填入「当前界面的序列」，但那条序列
+  // 常常和 PDB 里的完全无关（比如界面还停在上一次的 tRNA，导入的却是 ydaO），
+  // 一比对就是几十处错配、结构全乱。留空反而安全：不填就直接用 PDB 抽出的序列。
+  el.pdbDialog.showModal();
+}
+
+async function pdbReadFile(file) {
+  const name = (file.name || '').toLowerCase();
+  if (!/\.(pdb|ent|cif|mmcif|txt)$/.test(name)) {
+    el.pdbError.textContent = '请选择 .pdb / .ent / .cif / .mmcif 文件';
+    el.pdbError.hidden = false;
+    return;
+  }
+  pdbText = await file.text();
+  el.pdbFilename.textContent = `${file.name}（${(file.size / 1024).toFixed(0)} KB）`;
+  el.pdbText.value = '';
+  await pdbLoadChains();
+}
+
+async function pdbLoadChains() {
+  el.pdbError.hidden = true;
+  el.pdbSummary.hidden = true;
+  const text = pdbText || el.pdbText.value;
+  if (!text || !text.trim()) {
+    el.pdbError.textContent = '先选择文件或粘贴 PDB / mmCIF 内容';
+    el.pdbError.hidden = false;
+    return;
+  }
+  if (!pdbText) {
+    pdbText = text;
+    el.pdbFilename.textContent = '（粘贴的内容）';
+  }
+
+  setBusy(true, '解析结构…');
+  try {
+    const d = await api('/api/pdb/chains', { text: pdbText });
+    pdbChains = d.chains;
+    if (!pdbChains.length) throw new Error('文件里没有 RNA 链');
+
+    el.pdbChain.innerHTML = pdbChains.map((c, i) => (
+      `<option value="${c.chain_id}">链 ${c.chain_id} — ${c.length} nt`
+      + (c.modified_residues.length ? `（含 ${c.modified_residues.length} 种修饰）` : '')
+      + '</option>'
+    )).join('');
+    // 把链的序列显示出来，用户好判断该不该填参考序列
+    pdbUpdateChainHint();
+    el.pdbChain.addEventListener('change', pdbUpdateChainHint);
+    el.pdbStepFile.hidden = true;
+    el.pdbStepChain.hidden = false;
+    el.pdbImport.disabled = false;
+    await pdbRefreshPreview();
+  } catch (e) {
+    el.pdbError.textContent = e.message;
+    el.pdbError.hidden = false;
+  } finally {
+    setBusy(false);
+  }
+}
+
+/** 链选中后更新提示：显示这条链的序列，并给一个「用界面序列」的快捷入口 */
+function pdbUpdateChainHint() {
+  const c = pdbChains.find((x) => x.chain_id === el.pdbChain.value);
+  if (!c) { el.pdbChainHint.textContent = ''; return; }
+  const extra = pdbChains.length > 1 ? `文件里共 ${pdbChains.length} 条 RNA 链。` : '';
+  el.pdbChainHint.textContent =
+    `${extra}PDB 里抽出的序列（${c.length} nt）：${c.sequence_preview}`;
+
+  // 只有当界面序列和这条链长度接近时才提示可直接采用，避免张冠李戴
+  const cur = state.sequence || '';
+  if (cur && Math.abs(cur.length - c.length) <= Math.max(10, c.length * 0.15)) {
+    el.pdbRefHint.innerHTML =
+      `晶体结构常有残基没解析出来，填上完整序列可以把配对映射回去。`
+      + ` <button class="link-btn" id="pdb-ref-use-cur" type="button">用当前界面的序列（${cur.length} nt）</button>`;
+    const btn = document.getElementById('pdb-ref-use-cur');
+    if (btn) btn.onclick = () => { el.pdbReference.value = cur; void pdbRefreshPreview(); };
+  } else {
+    el.pdbRefHint.textContent =
+      '晶体结构常有残基没解析出来，填上完整序列可以把配对映射回去。'
+      + (cur ? '（当前界面的序列与这条链长度差得多，多半不是同一条，未提供快捷填入）' : '');
+  }
+}
+
+async function pdbRefreshPreview() {
+  if (!pdbChains.length) return;
+  const chainId = el.pdbChain.value;
+  setBusy(true, '判定配对…');
+  try {
+    const d = await api('/api/pdb/structure', {
+      text: pdbText,
+      chain_id: chainId,
+      reference: el.pdbReference.value.trim() || null,
+      include_noncanonical: el.pdbNoncanon.checked,
+      nested_only: el.pdbNested.checked,
+    });
+    pdbPreview = d;
+
+    const rows = [];
+    rows.push(`<div><span class="k">序列</span> <b>${d.length}</b> nt`
+      + (d.reference ? `　<span class="k">（与参考序列比对后）</span>` : '') + '</div>');
+    rows.push(`<div><span class="k">配对</span> <b>${d.n_pairs}</b> 对`
+      + `　经典 <b>${d.n_canonical}</b>　非经典 <b>${d.n_noncanonical}</b></div>`);
+    if (d.n_pseudoknot_pairs_dropped) {
+      rows.push(`<div><span class="k">为去假结丢弃</span> <b>${d.n_pseudoknot_pairs_dropped}</b> 对</div>`);
+    }
+    if (d.modified_residues.length) {
+      rows.push(`<div><span class="k">修饰核苷酸</span> <b>${d.modified_residues.join('、')}</b>`
+        + '　<span class="k">（已按其母体处理）</span></div>');
+    }
+    if (d.reference) {
+      const r = d.reference;
+      rows.push(`<div><span class="k">比对</span> 对齐 <b>${r.matched}</b>/${r.ref_length}`
+        + (r.missing_in_pdb.length
+          ? `　<span class="warn">PDB 缺失 ${r.missing_in_pdb.length} 个残基</span>` : '')
+        + (r.mismatches.length
+          ? `　<span class="warn">${r.mismatches.length} 处碱基不同</span>` : '')
+        + '</div>');
+    }
+    rows.push(`<div><span class="k">链</span> <b>${d.chain_id}</b></div>`);
+    el.pdbSummary.innerHTML = rows.join('');
+    el.pdbSummary.hidden = false;
+  } catch (e) {
+    el.pdbError.textContent = e.message;
+    el.pdbError.hidden = false;
+    pdbPreview = null;
+    el.pdbImport.disabled = true;
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function pdbDoImport() {
+  if (!pdbPreview) return;
+  const d = pdbPreview;
+  el.pdbDialog.close();
+
+  if (el.pdbSetseq.checked) {
+    // 连同序列一起载入：直接写进输入框和状态，不走 syncSequence（那会清空结构）
+    state.sequence = d.sequence;
+    el.seq.value = d.sequence;
+    el.statLen.textContent = d.sequence.length;
+    const gc = d.sequence.length
+      ? Math.round(((d.sequence.match(/[GC]/g) || []).length / d.sequence.length) * 100) : 0;
+    el.statGc.textContent = d.sequence.length ? gc + '%' : '–';
+    resetConstraintString(d.sequence.length);
+    state.lastRenderedPoints = null;
+    state.domains = [];
+    state.locatedRange = null;
+    renderDomains();
+    renderSeqStrip();
+  } else if (d.sequence !== state.sequence) {
+    // 不载入序列，但结构与当前序列对不上就没法画
+    addMessage('error',
+      `PDB 里的序列（${d.sequence.length} nt）与当前界面的序列（${state.sequence.length} nt）不一致，`
+      + '无法直接套用。请勾选「同时把序列载入主界面」再导入。');
+    return;
+  }
+
+  state.pairs = d.pairs.map((p) => [p.i, p.j]);
+  state.manualPoints = null;
+  state.fitPending = true;
+  state.pdbGaps = d.missing_regions || [];
+  // 把配体接触转成可标注的结合位点。金属离子单独一色，有机配体各用一色。
+  const LIG_COLORS = ['#C2410C', '#7B5EA7', '#0F766E', '#B45309'];
+  state.bindingSites = (d.ligands || []).map((L, k) => ({
+    name: L.name,
+    nAtoms: L.n_atoms,
+    isIon: L.n_atoms <= 2,
+    color: LIG_COLORS[k % LIG_COLORS.length],
+    positions: L.positions.map((x) => x.index),
+  }));
+  renderBindingSites();
+  // 用后端基于几何的判定结果，并让紧随其后的 evaluate 不要覆盖它
+  state.invalidPairs = new Set(
+    d.pairs.filter((p) => !p.canonical).map((p) => `${Math.min(p.i, p.j)},${Math.max(p.i, p.j)}`),
+  );
+  preserveNonCanonOnce = true;
+
+  clearMessages();
+  addMessage('note', `已从 PDB 链 ${d.chain_id} 导入：${d.length} nt，${d.n_pairs} 个配对`
+    + `（经典 ${d.n_canonical}，非经典 ${d.n_noncanonical}）`);
+  if (d.modified_residues.length) {
+    addMessage('note', `修饰核苷酸 ${d.modified_residues.join('、')} 已按其母体处理`);
+  }
+  for (const n of d.notes || []) addMessage('note', n);
+
+  await doEvaluate();
+  pushHistory(`从 PDB 导入（链 ${d.chain_id}）`);
+  toast(`已导入 ${d.n_pairs} 个配对`);
+}
+
 /* ─────────────────────────── 启动 ─────────────────────────── */
 
 async function init() {
@@ -3275,6 +3625,7 @@ async function init() {
   updateHistoryButtons();
   renderDomains();
   renderSeqStrip();
+  renderBindingSites();
 
   // 关闭/刷新前补存一次，免得最后一步改动没落盘
   window.addEventListener('beforeunload', () => {

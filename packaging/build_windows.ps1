@@ -22,7 +22,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 $AppName = "RNA Studio"
-$Version = "0.0.3"
+$Version = "0.0.4"
 $Out = Join-Path $Root "release"
 
 Write-Host "==> 项目目录：$Root"

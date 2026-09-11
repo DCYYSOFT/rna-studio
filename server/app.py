@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import engines, layout as layout_mod, varna
+from . import engines, layout as layout_mod, pdb as pdb_mod, varna
 from .ct import read_ct, write_ct
 from .dotbracket import StructureError, parse, pairs_to_dotbracket, structural_distance
 from .paths import resource
@@ -91,6 +91,22 @@ class RenderReq(BaseModel):
     color_min: float | None = None
     color_max: float | None = None
     rotation: float | None = None
+
+
+class PdbParseReq(BaseModel):
+    text: str
+    fmt: str | None = None            # pdb | cif，不给就自动判断
+
+
+class PdbStructureReq(BaseModel):
+    text: str
+    chain_id: str
+    fmt: str | None = None
+    reference: str | None = None       # 可选的参考序列，用于把配对映射回完整长度
+    include_noncanonical: bool = True
+    # 默认保留假结：读 PDB 就是要拿实验测到的真实结构，假结本来就是真实存在的。
+    # 置 True 会去掉造成交叉的配对，换来一个能算 ΔG 的嵌套结构。
+    nested_only: bool = False
 
 
 class ExportReq(BaseModel):
@@ -397,6 +413,55 @@ def api_render_varna(req: RenderReq, fmt: str = Query("svg")):
         return Response(content=data, media_type=media)
     except StructureError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# ───────────────────────── PDB / mmCIF 导入 ─────────────────────────
+
+@app.post("/api/pdb/chains")
+def api_pdb_chains(req: PdbParseReq):
+    """列出文件里的 RNA 链，供用户挑选。"""
+    try:
+        chains, ligands = pdb_mod.parse_structure(req.text, req.fmt)
+    except StructureError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    names = sorted({l["name"] for l in ligands})
+    return {
+        "chains": [pdb_mod.chain_summary(c) for c in chains],
+        "n_chains": len(chains),
+        "n_ligands": len(ligands),
+        "ligand_names": names,
+    }
+
+
+@app.post("/api/pdb/structure")
+def api_pdb_structure(req: PdbStructureReq):
+    """把指定链的三维坐标转成二级结构。"""
+    try:
+        chains, ligands = pdb_mod.parse_structure(req.text, req.fmt)
+    except StructureError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    chain = next((c for c in chains if c.chain_id == req.chain_id), None)
+    if chain is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件里没有链 {req.chain_id}；可选的链：{'、'.join(c.chain_id for c in chains)}",
+        )
+
+    try:
+        res = pdb_mod.structure_from_chain(
+            chain,
+            ligands=ligands,
+            reference=req.reference,
+            include_noncanonical=req.include_noncanonical,
+            nested_only=req.nested_only,
+        )
+    except StructureError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    # 顺带给出与 MFE 的对照：实验结构和预测结构差多少，是很有价值的参照
+    res["available_chains"] = [c.chain_id for c in chains]
+    return res
 
 
 @app.post("/api/export")
