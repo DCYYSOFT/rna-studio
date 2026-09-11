@@ -1,0 +1,20 @@
+# 桌面版（打包成原生应用）所需的额外依赖
+# 与 requirements.txt 一起用：pip install -r requirements.txt -r requirements-desktop.txt
+#
+# pywebview 用系统自带的浏览器内核开原生窗口：
+#   macOS   → WKWebView（由 pyobjc 的 WebKit 绑定提供，系统自带框架）
+#   Windows → WebView2（由 pythonnet 调用，Win10 1803+ / Win11 自带运行时）
+# 所以两个平台都需要各自的原生绑定，这里用环境标记区分。
+
+pywebview>=5.0
+
+# macOS：WKWebView 绑定
+pyobjc-core>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-WebKit>=10.0; sys_platform == "darwin"
+
+# Windows：调用 WebView2 需要 .NET 绑定
+pythonnet>=3.0; sys_platform == "win32"
+
+# 打包
+pyinstaller>=6.6

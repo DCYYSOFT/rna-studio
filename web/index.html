@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RNA Studio — 二级结构预测与手动建模</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">RNA Studio</span>
+    <span class="brand-sub">二级结构预测 · 可视化 · 手动建模</span>
+  </div>
+  <div class="topbar-right">
+    <button id="btn-status" class="status-chip" type="button" aria-expanded="false">检查环境</button>
+  </div>
+</header>
+
+<div id="status-panel" class="status-panel" hidden></div>
+
+<main class="shell">
+
+  <!-- ────────────────────────── 左侧控制栏 ────────────────────────── -->
+  <aside class="rail" id="rail">
+
+    <section class="block">
+      <h2 class="block-title">序列</h2>
+      <div class="mode-switch" role="tablist" aria-label="分析模式">
+        <button class="mode-btn is-on" data-mode="single" role="tab" aria-selected="true">单链折叠</button>
+        <button class="mode-btn" data-mode="manual" role="tab" aria-selected="false">手动建模</button>
+        <button class="mode-btn" data-mode="cofold" role="tab" aria-selected="false"
+                title="预测两条 RNA 之间的相互作用结构">共折叠</button>
+      </div>
+
+      <label class="field">
+        <span class="field-label">
+          序列（支持 FASTA 粘贴，自动转 DNA→RNA）
+        </span>
+        <textarea id="seq" rows="5" spellcheck="false"
+          placeholder="粘贴序列，例如&#10;GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAG"></textarea>
+      </label>
+
+      <div id="cofold-block" hidden>
+        <label class="field">
+          <span class="field-label">第二条链（链 B）</span>
+          <textarea id="seq-b" rows="3" spellcheck="false" placeholder="靶标 mRNA / sRNA 靶序列"></textarea>
+        </label>
+      </div>
+
+      <div class="readouts">
+        <span><b id="stat-len">0</b> nt</span>
+        <span>GC <b id="stat-gc">–</b></span>
+        <span id="stat-mode-wrap">配对 <b id="stat-pairs">0</b></span>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-fold" class="btn btn-primary" type="button">折叠</button>
+        <button id="btn-mfe" class="btn" type="button" title="恢复为最小自由能结构">取 MFE</button>
+        <button id="btn-reset" class="btn btn-quiet" type="button">清空</button>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2 class="block-title">参数</h2>
+
+      <label class="field">
+        <span class="field-label">预测引擎</span>
+        <select id="engine"></select>
+        <span class="field-hint" id="engine-hint"></span>
+      </label>
+
+      <label class="field" id="method-wrap">
+        <span class="field-label">方法</span>
+        <select id="method"></select>
+        <span class="field-hint" id="method-hint"></span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">布局</span>
+        <select id="layout">
+          <option value="naview">naview — 经典三叶草/茎环</option>
+          <option value="circular">环形 — 可显示假结</option>
+          <option value="linear">线性 — 弧线图，适合长链</option>
+        </select>
+      </label>
+
+      <label class="field field-inline">
+        <span class="field-label">温度</span>
+        <input id="temperature" type="number" value="37" min="0" max="100" step="1">
+        <span class="unit">°C</span>
+      </label>
+    </section>
+
+    <section class="block">
+      <h2 class="block-title">约束与实验数据</h2>
+      <p class="block-hint">
+        在结构图上点两个碱基即可建立配对；右键点碱基解除其配对。
+        Alt+点击 或 Shift+点击 可标记「禁止配对」。以下约束在点「折叠」时生效。
+      </p>
+
+      <div class="readouts readouts-tight">
+        <span>强制 <b id="stat-forced">0</b></span>
+        <span>禁配 <b id="stat-forbidden">0</b></span>
+        <button id="btn-clear-cons" class="link-btn" type="button">清除全部</button>
+      </div>
+
+      <label class="field">
+        <span class="field-label">约束串（可直接编辑，长度须与序列一致）</span>
+        <textarea id="constraints" rows="3" spellcheck="false"
+          placeholder=". 无约束　( ) 强制配对　x 禁止配对"></textarea>
+      </label>
+
+      <div class="constraint-actions">
+        <button id="btn-cons-from-struct" class="btn btn-quiet" type="button">
+          用当前结构作为约束
+        </button>
+      </div>
+
+      <label class="field field-inline">
+        <span class="field-label">探测数据</span>
+        <select id="probing-method">
+          <option value="">不使用</option>
+          <option value="SHAPE">SHAPE</option>
+          <option value="DMS">DMS</option>
+        </select>
+      </label>
+
+      <div id="probing-block" hidden>
+        <label class="field">
+          <span class="field-label">
+            反应性数值（每行「位置 数值」，或单行空格分隔；缺测写 -999）
+          </span>
+          <textarea id="probing-data" rows="4" spellcheck="false"
+            placeholder="1 0.042&#10;2 -999&#10;3 0.15"></textarea>
+        </label>
+        <div class="two-col">
+          <label class="field field-inline">
+            <span class="field-label">斜率</span>
+            <input id="probing-m" type="number" value="1.8" step="0.1">
+          </label>
+          <label class="field field-inline">
+            <span class="field-label">截距</span>
+            <input id="probing-b" type="number" value="-0.6" step="0.1">
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2 class="block-title">能量分解</h2>
+      <div id="decomp" class="decomp"><p class="empty">折叠或评估后显示逐环能量。</p></div>
+    </section>
+
+    <section class="block">
+      <h2 class="block-title">出图</h2>
+      <p class="block-hint">
+        下面两项设置对画布显示和两种出图都生效。
+      </p>
+
+      <label class="field">
+        <span class="field-label">碱基着色依据</span>
+        <select id="color-mode">
+          <option value="base">按碱基种类</option>
+          <option value="pairprob">按配对概率（热图）</option>
+          <option value="probing">按探测反应性（热图）</option>
+        </select>
+      </label>
+
+      <label class="field field-inline">
+        <span class="field-label">编号周期</span>
+        <input id="period-num" type="number" value="10" min="0" step="1">
+      </label>
+
+      <div class="divider"><span>内置出图（不需要 Java）</span></div>
+
+      <div class="btn-row">
+        <button id="btn-svg" class="btn btn-primary" type="button">导出 SVG</button>
+        <button id="btn-png" class="btn" type="button">导出 PNG</button>
+      </div>
+
+      <label class="field">
+        <span class="field-label">取景</span>
+        <select id="svg-scope">
+          <option value="full">整幅结构（推荐用于插图）</option>
+          <option value="view">当前画面（含缩放）</option>
+        </select>
+      </label>
+
+      <div class="divider"><span>VARNA 出图（需要 Java）</span></div>
+
+      <label class="field">
+        <span class="field-label">绘图算法</span>
+        <select id="varna-algo">
+          <option value="naview">naview</option>
+          <option value="radiate">radiate</option>
+          <option value="circular">circular</option>
+          <option value="line">line</option>
+        </select>
+      </label>
+
+      <label class="field" id="bpstyle-wrap" hidden>
+        <span class="field-label">碱基对样式</span>
+        <select id="bpstyle">
+          <option value="">默认</option>
+          <option value="lw">lw</option>
+          <option value="lwalt">lwalt</option>
+          <option value="simple">simple</option>
+          <option value="rnaviz">rnaviz</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+
+      <div class="btn-row">
+        <button id="btn-varna-svg" class="btn" type="button">VARNA SVG</button>
+        <button id="btn-varna-png" class="btn" type="button">PNG</button>
+        <button id="btn-varna-eps" class="btn btn-quiet" type="button">EPS</button>
+      </div>
+
+      <span class="field-hint" id="varna-hint"></span>
+    </section>
+
+<h2 class="block-title">数据导出</h2>
+      <div class="btn-row btn-row-wrap">
+        <button class="btn btn-quiet" data-export="ct" type="button">导出 CT</button>
+        <button class="btn btn-quiet" data-export="dotbracket" type="button">dot-bracket</button>
+        <button class="btn btn-quiet" data-export="fasta" type="button">FASTA</button>
+        <button id="btn-import" class="btn btn-quiet" type="button">导入结构…</button>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ────────────────────────── 右侧视图区 ────────────────────────── -->
+  <section class="view">
+
+    <div class="meter" id="meter" aria-live="polite">
+      <div class="meter-main">
+        <span class="meter-label">当前 ΔG</span>
+        <span class="meter-value" id="m-dg">—</span>
+        <span class="meter-unit">kcal/mol</span>
+      </div>
+      <div class="meter-facts">
+        <div class="fact">
+          <span class="fact-label">MFE ΔG</span>
+          <span class="fact-value" id="m-mfe">—</span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">与 MFE 差</span>
+          <span class="fact-value" id="m-dd">—</span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">引擎</span>
+          <span class="fact-value" id="m-engine">—</span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">布局</span>
+          <span class="fact-value" id="m-layout">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap">
+      <div class="canvas-toolbar">
+        <div class="tool-group" role="group" aria-label="缩放">
+          <button class="tool" id="zoom-out" type="button" title="缩小">−</button>
+          <button class="tool" id="zoom-fit" type="button" title="适应窗口">适应</button>
+          <button class="tool" id="zoom-in" type="button" title="放大">+</button>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="canvas-scroll" id="canvas-scroll">
+        <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div class="canvas-empty" id="canvas-empty">
+          <p>还没有结构。</p>
+          <p class="dim">在上面粘贴序列，然后点「折叠」。或者切到「手动建模」自己搭。</p>
+        </div>
+      </div>
+      <div class="hover-readout" id="hover-readout"></div>
+    </div>
+
+    <div class="messages" id="messages"></div>
+
+    <details class="structure-strip">
+      <summary>结构与序列</summary>
+      <div class="strip-body">
+        <div class="strip-row">
+          <span class="strip-label">dot-bracket</span>
+          <code id="out-struct" class="mono wrap"></code>
+        </div>
+        <div class="strip-row">
+          <span class="strip-label">序列</span>
+          <code id="out-seq" class="mono wrap"></code>
+        </div>
+      </div>
+    </details>
+  </section>
+</main>
+
+<dialog id="import-dialog" class="dialog">
+  <form method="dialog" class="dialog-form">
+    <h2 class="dialog-title">导入结构</h2>
+    <label class="field">
+      <span class="field-label">格式</span>
+      <select id="import-fmt">
+        <option value="ct">CT（RNAstructure / mfold）</option>
+        <option value="dotbracket">dot-bracket（含 FASTA 头也可）</option>
+      </select>
+    </label>
+    <label class="field">
+      <span class="field-label">内容</span>
+      <textarea id="import-text" rows="10" spellcheck="false" placeholder="粘贴 CT 或 dot-bracket"></textarea>
+    </label>
+    <p class="dialog-error" id="import-error" hidden></p>
+    <div class="dialog-actions">
+      <button class="btn btn-quiet" value="cancel" type="submit">取消</button>
+      <button class="btn btn-primary" id="import-confirm" value="ok" type="submit">导入</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<div id="busy" class="busy" hidden><span class="spinner"></span><span id="busy-text">计算中…</span></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

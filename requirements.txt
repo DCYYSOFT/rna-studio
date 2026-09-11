@@ -1,0 +1,10 @@
+# RNA Studio 运行依赖
+#
+# ViennaRNA 是主预测引擎，PyPI 上有 macOS(arm64/x86_64) 与 Linux 的预编译 wheel，
+# 一般不需要本地编译。若 pip 找不到对应 wheel，会退化为源码编译，
+# 此时需要 Xcode Command Line Tools（xcode-select --install）。
+ViennaRNA>=2.6,<3
+
+fastapi>=0.110
+uvicorn>=0.27
+pydantic>=2.5

@@ -1,0 +1,18 @@
+# 运行/构建产物
+.venv/
+.venv-build/
+dist/
+build/
+release/
+__pycache__/
+*.pyc
+
+# 构建时由 jlink 生成，平台相关，不入库
+jre/
+runtime/
+
+# 可选引擎，由 setup_rnastructure.sh 下载
+vendor/RNAstructure/
+
+# 运行日志
+rna-studio.log

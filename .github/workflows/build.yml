@@ -1,0 +1,200 @@
+name: 构建安装包
+
+# 打包必须在目标系统上执行（PyInstaller 不支持跨平台编译），
+# 所以这里用两个 runner 各出一份。
+#
+# 触发方式：
+#   · 手动：Actions 页面点「Run workflow」
+#   · 推送 tag（形如 v1.1.0）：构建完自动创建 Release 并附上安装包
+#   · 推送到 main 且改动了源码：只构建、不发布（方便确认没坏）
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+    paths:
+      - "server/**"
+      - "web/**"
+      - "vendor/**"
+      - "packaging/**"
+      - "desktop.py"
+      - "requirements*.txt"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write      # 创建 Release 需要
+
+jobs:
+  # ─────────────────────────── macOS (Apple Silicon) ───────────────────────────
+  macos:
+    name: macOS arm64
+    runs-on: macos-14          # Apple Silicon runner，产出 arm64 应用
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 3.12 在 macOS arm64 与 Windows x64 上都有 ViennaRNA 预编译 wheel
+          python-version: "3.12"
+
+      - name: 安装 JDK（提供 jlink，用于生成随包精简 JRE）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 确认 jlink 可用
+        run: jlink --version
+
+      - name: 构建 .app 与 .dmg
+        run: |
+          chmod +x packaging/build_macos.sh
+          bash packaging/build_macos.sh
+
+      - name: 冒烟测试（确认打包产物能启动后端）
+        run: |
+          set -e
+          APP="dist/RNA Studio.app/Contents/MacOS/RNA Studio"
+          test -x "$APP" || { echo "找不到可执行文件"; exit 1; }
+
+          # 打包后的程序 console=False，没有标准输出，只能靠它写出的地址文件拿端口
+          URLFILE="$RUNNER_TEMP/rna-url.txt"
+          rm -f "$URLFILE"
+          export RNA_STUDIO_URL_FILE="$URLFILE"
+
+          "$APP" &
+          APP_PID=$!
+
+          ok=0
+          for i in $(seq 1 45); do
+            sleep 1
+            if [ -s "$URLFILE" ]; then
+              URL=$(grep -oE 'http://127\.0\.0\.1:[0-9]+/' "$URLFILE" | tail -1)
+              if [ -n "$URL" ] && curl -sf "${URL}api/status" > "$RUNNER_TEMP/status.json"; then
+                echo "后端已就绪：$URL"
+                python3 -c "import json;d=json.load(open('$RUNNER_TEMP/status.json'));print('引擎:',[(e['id'],e['available'],e.get('version')) for e in d['engines']]);print('VARNA:',d['varna']['available'],'| Java 来源:',d['varna'].get('java_source'))"
+                ok=1
+                break
+              fi
+            fi
+          done
+
+          kill $APP_PID 2>/dev/null || true
+          if [ "$ok" != "1" ]; then
+            echo "------ 地址文件 ------"; cat "$URLFILE" 2>/dev/null || echo "(未生成)"
+            exit 1
+          fi
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: RNA-Studio-macOS-arm64
+          path: release/*.dmg
+          if-no-files-found: error
+
+  # ─────────────────────────── Windows ───────────────────────────
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 JDK（提供 jlink，用于生成随包精简 JRE）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 构建 exe 与 zip
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+
+      - name: 冒烟测试（确认打包产物能启动后端）
+        shell: powershell
+        run: |
+          $exe = "dist\RNA Studio\RNA Studio.exe"
+          if (-not (Test-Path $exe)) { Write-Error "找不到可执行文件"; exit 1 }
+
+          # 打包后的程序 console=False，没有标准输出，只能靠它写出的地址文件拿端口
+          $urlFile = Join-Path $env:TEMP "rna-url.txt"
+          if (Test-Path $urlFile) { Remove-Item $urlFile -Force }
+          $env:RNA_STUDIO_URL_FILE = $urlFile
+
+          $p = Start-Process -FilePath $exe -PassThru
+
+          $url = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $urlFile) {
+              $txt = Get-Content $urlFile -Raw -ErrorAction SilentlyContinue
+              if ($txt -match 'http://127\.0\.0\.1:(\d+)/') {
+                $candidate = $Matches[0]
+                try {
+                  $r = Invoke-WebRequest -Uri "${candidate}api/status" -UseBasicParsing -TimeoutSec 3
+                  $url = $candidate
+                  Write-Host "后端已就绪：$candidate"
+                  $r.Content
+                  break
+                } catch { }
+              }
+            }
+          }
+
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+          if (-not $url) {
+            Write-Host "------ 地址文件 ------"
+            if (Test-Path $urlFile) { Get-Content $urlFile } else { Write-Host "(未生成)" }
+            exit 1
+          }
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: RNA-Studio-Windows-x64
+          path: release/*.zip
+          if-no-files-found: error
+
+  # ─────────────────────────── 打 tag 时发布 Release ───────────────────────────
+  release:
+    name: 发布 Release
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 列出产物
+        run: find artifacts -type f | sort
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            **macOS（Apple Silicon）**
+            打开 `.dmg`，把 RNA Studio 拖进「应用程序」。
+            首次打开请**右键点击 → 打开 → 再点「打开」**（应用未做苹果开发者签名，
+            这是正常提示）。只需一次，之后双击即可。
+
+            **Windows（64 位）**
+            解压 zip，双击 `RNA Studio.exe`。
+            首次运行若弹出 SmartScreen「已保护你的电脑」，点「更多信息」→「仍要运行」。
+
+            ## 说明
+
+            安装包已自带 Python 运行环境、RNA 预测引擎和精简 Java 运行时，
+            不需要额外安装任何东西。应用在本机运行，不联网。
