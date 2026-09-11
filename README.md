@@ -6,16 +6,18 @@
 
 ---
 
+## 下载
+
+| 你的系统 | 安装包 | 打开方式 |
+|---|---|---|
+| macOS（Apple Silicon） | [RNA-Studio-1.1.0-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v1.1.0/RNA-Studio-1.1.0-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-1.1.0-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v1.1.0/RNA-Studio-1.1.0-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+
+全部版本见 [Releases](../../releases)。
+
 ## 两种用法
 
 ### 方式一：安装包（推荐，不用碰命令行）
-
-从 Releases 页面下载对应平台的文件：
-
-| 你的系统 | 下载 | 打开方式 |
-|---|---|---|
-| macOS（Apple Silicon） | `RNA-Studio-x.x.x-macOS-arm64.dmg` | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | `RNA-Studio-x.x.x-Windows-x64.zip` | 解压后双击 `RNA Studio.exe` |
 
 双击就是一个独立的应用程序窗口，没有终端、没有浏览器地址栏。
 安装包**自带 Python、预测引擎和 Java 运行时**，不需要额外装任何东西。
