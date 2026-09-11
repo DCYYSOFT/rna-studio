@@ -53,6 +53,30 @@ jobs:
           chmod +x packaging/build_macos.sh
           bash packaging/build_macos.sh
 
+      - name: 验证图标已打进 .app
+        run: |
+          set -e
+          ICON="dist/RNA Studio.app/Contents/Resources/icon.icns"
+          PLIST="dist/RNA Studio.app/Contents/Info.plist"
+          if [ ! -f "$ICON" ]; then
+            echo "✗ .app 里没有 icon.icns —— 图标没被打进去"
+            ls -la "dist/RNA Studio.app/Contents/Resources/" || true
+            exit 1
+          fi
+          python3 - "$ICON" <<'EOF'
+          import struct, sys, pathlib
+          d = pathlib.Path(sys.argv[1]).read_bytes()
+          assert d[:4] == b"icns", "不是 ICNS 文件"
+          declared = struct.unpack(">I", d[4:8])[0]
+          assert declared == len(d), f"ICNS 声明长度 {declared} 与实际 {len(d)} 不符"
+          print(f"✓ icon.icns 正常：{len(d)} 字节")
+          EOF
+          if ! grep -q "CFBundleIconFile" "$PLIST"; then
+            echo "✗ Info.plist 里没有 CFBundleIconFile"
+            exit 1
+          fi
+          echo "✓ Info.plist 已引用图标"
+
       - name: 冒烟测试（确认打包产物能启动后端）
         run: |
           set -e
@@ -126,6 +150,30 @@ jobs:
         shell: pwsh
         run: |
           ./packaging/build_windows.ps1
+
+      - name: 验证图标已嵌入 exe（检查 PE 资源目录）
+        shell: pwsh
+        run: |
+          # 图标没打进去时 PyInstaller 不一定报错，只是给个默认图标，
+          # 所以这里直接解析 PE 的资源目录确认 RT_GROUP_ICON 存在。
+          $py = @'
+          import sys, pefile
+          pe = pefile.PE(sys.argv[1], fast_load=True)
+          pe.parse_data_directories(
+              directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
+          types = {}
+          if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+              for e in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                  types[e.id] = len(e.directory.entries)
+          if 14 not in types:
+              print("MISSING: no RT_GROUP_ICON")
+              sys.exit(1)
+          print(f"OK: RT_GROUP_ICON={types.get(14)} RT_ICON={types.get(3)}")
+          '@
+          Set-Content -Path check_icon.py -Value $py -Encoding UTF8
+           python -m pip install --quiet pefile
+           python check_icon.py "dist\RNA Studio\RNA Studio.exe"
+           if ($LASTEXITCODE -ne 0) { Write-Error "exe 没有嵌入图标"; exit 1 }
 
       - name: 冒烟测试（确认打包产物能启动后端）
         shell: pwsh
