@@ -214,12 +214,15 @@ function distToLine(p, a, b) {
 
   // 建树端到端：剔除后按未配对归环
   const tree = S.buildStructureTree(pairs1, 16);
-  ok(tree.elements.has('stem:0-10') && !tree.elements.has('stem:4-14'), 'X 交叉配对不入树');
-  ok(tree.ignoredPkPairs.length === 1 && tree.ignoredPkPairs[0].join('-') === '4-14',
-    'X ignoredPkPairs 清单');
-  ok(tree.elements.get('loop:3-7').residues.join(',') === '3,4,5,6,7', 'X 剔除后残基按未配对归环');
-  ok(tree.elements.get('ext').residues.join(',') === '11,12,13,14,15', 'X ext 残基');
-  ok(tree.residueToElement.every((x) => x !== null), 'X 剔除后残基仍全覆盖');
+  ok(tree.elements.has('stem:0-10') && !tree.elements.has('stem:4-14')
+    && tree.elements.has('pk1:stem:4-14'), 'X 交叉配对不入主树、进入 PK1');
+  ok(tree.ignoredPkPairs.length === 0, 'X PK1 提取后无超限配对');
+  ok(tree.elements.get('pk1:stem:4-14').label === 'PK1-1'
+    && tree.residueToElement[4] === 'pk1:stem:4-14'
+    && tree.residueToElement[14] === 'pk1:stem:4-14', 'X PK1 元素与残基归属');
+  ok(tree.elements.get('loop:3-7').residues.join(',') === '3,5,6,7', 'X PK 残基从环中回收');
+  ok(tree.elements.get('ext').residues.join(',') === '11,12,13,15', 'X ext 残基（14 归 PK1）');
+  ok(tree.residueToElement.every((x) => x !== null), 'X 残基仍全覆盖');
 }
 
 /* ═══════════ override 清理 ═══════════ */
@@ -379,6 +382,57 @@ function distToLine(p, a, b) {
   // 无碰撞时 autoAvoid 不动
   const res0 = S.autoAvoid(tree, base, {}, 'stem:4-10', { pairs: pairsC });
   ok(res0.shifted === false && res0.after === 0, 'C 无碰撞时不产生位移');
+}
+
+/* ═══════════ 假结层级（PK1 / PK2…）═══════════ */
+{
+  // 经典假结 + 二级交叉：主茎 (10,20)；PK1 = (15,40)(16,39)；(35,55) 只与 PK1 交叉 → PK2
+  const n = 60;
+  const pairs = [[10, 20], [11, 19], [15, 40], [16, 39], [30, 50], [35, 55]];
+  const tree = S.buildStructureTree(pairs, n);
+  ok(tree.elements.has('stem:10-20') && tree.elements.has('stem:30-50'), 'K 主层保留两个茎');
+  const p1 = tree.elements.get('pk1:stem:15-40');
+  const p2 = tree.elements.get('pk2:stem:35-55');
+  ok(!!p1 && p1.pkLevel === 1 && p1.label === 'PK1-1', 'K (15,40)(16,39) 组成 PK1');
+  ok(!!p2 && p2.pkLevel === 2 && p2.label === 'PK2-1', 'K (35,55) 进入 PK2');
+  ok(tree.ignoredPkPairs.length === 0, 'K 无超限配对');
+  ok(tree.residueToElement[15] === 'pk1:stem:15-40'
+    && tree.residueToElement[35] === 'pk2:stem:35-55', 'K 残基归属正确');
+  ok(tree.residueToElement.every((x) => x !== null), 'K 残基全覆盖');
+
+  const base = makePts(n);
+  const eff = S.effectivePoints(base, tree, { 'pk1:stem:15-40': { angle: 90 } });
+  let pk1Moved = true;
+  let othersSame = true;
+  for (let i = 0; i < n; i++) {
+    const moved = !nearPt(eff[i], base[i], 1e-9);
+    if ([15, 16, 39, 40].includes(i)) { if (!moved) pk1Moved = false; }
+    else if (moved) othersSame = false;
+  }
+  ok(pk1Moved && othersSame, 'K 旋转 PK1：只动 PK1 残基');
+  rigidInvariant(base, eff, [15, 16, 39, 40], 'K PK1 刚体');
+  const eff2 = S.effectivePoints(base, tree, { 'pk2:stem:35-55': { angle: 45 } });
+  ok(!nearPt(eff2[35], base[35], 1e-9) && nearPt(eff2[15], base[15], 1e-9), 'K 旋转 PK2 不影响 PK1');
+  const eff3 = S.effectivePoints(base, tree, { 'stem:10-20': { angle: 30 } });
+  ok(nearPt(eff3[15], base[15], 1e-9) && nearPt(eff3[35], base[35], 1e-9), 'K 主茎与 PK 互相独立（同级）');
+}
+
+{
+  // 挂接进主树：外套茎 (0,40) 的内环里坐着内茎 (5,30)，PK (20,35) 跨内茎 → 挂外套环，随父级旋转
+  const n = 41;
+  const pairs = [[0, 40], [1, 39], [5, 30], [6, 29], [20, 35]];
+  const tree = S.buildStructureTree(pairs, n);
+  const pk = tree.elements.get('pk1:stem:20-35');
+  ok(!!pk, 'K2 PK1 提取');
+  ok(pk.parent === 'loop:2-38', 'K2 挂到最内层容器（外套环）', pk.parent);
+  ok(tree.elements.get('loop:2-38').children.includes('pk1:stem:20-35'), 'K2 在容器 children 中');
+  ok(!tree.elements.get('loop:7-28').residues.includes(20), 'K2 残基从内发夹环回收');
+  const base = makePts(n);
+  const eff = S.effectivePoints(base, tree, { 'stem:0-40': { angle: 30 } });
+  const pv1 = mid(base[0], base[40]);
+  ok(nearPt(eff[20], rot(30, base[20], pv1), 1e-9), 'K2 转外套茎：PK 随父级旋转（独立复算）');
+  const eff2 = S.effectivePoints(base, tree, { 'pk1:stem:20-35': { angle: 90 } });
+  ok(!nearPt(eff2[20], base[20], 1e-9) && nearPt(eff2[5], base[5], 1e-9), 'K2 单独转 PK 不影响主茎');
 }
 
 /* ═══════════ 汇总 ═══════════ */

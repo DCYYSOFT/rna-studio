@@ -21,8 +21,9 @@
  *   有效坐标 = 基点坐标依次经过各层 stem 的局部运动（先绕 pivot 旋转、再平移），
  *   父级运动整体作用到子树 → 嵌套自然合成。旋转是纯函数，可反复重算、无累积误差。
  *
- * 假结（交叉配对）不参与建树：剔除后仅作 overlay 画线；被剔除的配对残基
- * 按“未配对”处理，归入所在环。
+ * 假结（交叉配对）不进入主树：按「逐层提取」组织为 PK1、PK2… 子树
+ * （只建 stem，按跨度嵌入最内层容器），可像普通 stem 一样选中/旋转；
+ * 超出层级上限（默认 4）的配对仅作 overlay 画线。
  */
 (function (global) {
   'use strict';
@@ -93,10 +94,20 @@
    * @param {Array<[number, number]>} pairs
    * @param {number} n 序列长度
    */
-  function buildStructureTree(pairs, n) {
+  function buildStructureTree(pairs, n, opts) {
+    const maxPkLevels = (opts && opts.maxPkLevels) || 4;
     const norm = normPairs(pairs || []);
-    const { kept: treePairs, dropped } = nonCrossingSubset(norm);
-    const ignoredPkPairs = dropped.slice().sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+
+    // ① 分层：优先主结构（level 0），其余配对逐层提取（假结层级 PK1、PK2…）
+    const layers = [];
+    let rest = norm;
+    for (let lv = 0; lv <= maxPkLevels && rest.length; lv++) {
+      const { kept, dropped } = nonCrossingSubset(rest);
+      layers.push(kept);
+      rest = dropped;
+    }
+    const ignoredPkPairs = rest.slice().sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+    const treePairs = layers[0] || [];
 
     // 连续堆叠切 stem：下一对恰为 (i+1, j-1) 则并入同一 stem
     const runs = [];
@@ -193,6 +204,7 @@
       addElement({
         id: s.id, type: 'stem', residues: s.residues, pairs: s.pairs,
         parent: null, children: [], label: s.label, proximalPair: s.proximalPair,
+        minI: s.minI, maxJ: s.maxJ,
       });
     }
 
@@ -216,13 +228,67 @@
       elements.get(s.id).parent = owningLoopId;
     }
 
+    // ② 假结层级（PK1、PK2…）：只建 stem 元素，按跨度嵌入最内层容器
+    const pkStemIds = [];
+    const spanOf = (el) => {
+      if (el.type === 'stem') return [el.minI, el.maxJ];
+      if (el.type === 'exterior') return [0, n - 1];
+      return [el.lo, el.hi];
+    };
+    for (let lv = 1; lv < layers.length; lv++) {
+      const runs2 = [];
+      let run2 = null;
+      for (const [i, j] of layers[lv]) {
+        const prev = run2 && run2[run2.length - 1];
+        if (prev && i === prev[0] + 1 && j === prev[1] - 1) run2.push([i, j]);
+        else { run2 = [[i, j]]; runs2.push(run2); }
+      }
+      runs2.forEach((pairsRun, idx) => {
+        const [i0, j0] = pairsRun[0];
+        const id = `pk${lv}:stem:${i0}-${j0}`;
+        const residues = [];
+        for (const [i, j] of pairsRun) residues.push(i, j);
+        residues.sort((a, b) => a - b);
+        // 从原属主（主树里的环）回收残基
+        for (const r of residues) {
+          const oldId = residueToElement[r];
+          if (oldId && elements.has(oldId)) {
+            const oe = elements.get(oldId);
+            oe.residues = oe.residues.filter((x) => x !== r);
+          }
+          residueToElement[r] = id;
+        }
+        // 最内层容器：stem 用跨度、环用区域，取范围最小者
+        let container = elements.get('ext');
+        let bestSize = Infinity;
+        for (const cand of elements.values()) {
+          if (cand.type === 'exterior') continue;
+          const [lo, hi] = spanOf(cand);
+          if (lo <= i0 && j0 <= hi) {
+            const size = hi - lo;
+            if (size < bestSize) { bestSize = size; container = cand; }
+          }
+        }
+        const el = {
+          id, type: 'stem', pkLevel: lv, label: `PK${lv}-${idx + 1}`,
+          residues, pairs: pairsRun.map((p) => [p[0], p[1]]),
+          proximalPair: [i0, j0], minI: i0, maxJ: j0,
+          parent: container.id, children: [],
+        };
+        elements.set(id, el);
+        container.children.push(id);
+        pkStemIds.push(id);
+      });
+    }
+
     return {
       n,
       elements,
       rootId: 'ext',
       residueToElement,
       ignoredPkPairs,
-      stems: bySpan.map((s) => s.id),
+      stems: bySpan.map((s) => s.id).concat(pkStemIds),
+      pkStems: pkStemIds,
     };
   }
 
@@ -614,26 +680,16 @@
     const ov = overrides;
     const out = new Array(base.length);
 
-    const localMatrix = (stem, M) => localMatrixOf(tree, stem, M, base, ov);
-
-    const paint = (residues, M) => {
-      for (const i of residues) out[i] = applyM(M, base[i]);
+    // 通用遍历：stem 叠局部运动；环在锚点就绪后做形变（PK 元素与主树同一套遍历）
+    const walk = (el, M) => {
+      if (!el) return;
+      const M2 = el.type === 'stem' ? localMatrixOf(tree, el, M, base, ov) : M;
+      for (const i of el.residues) out[i] = applyM(M2, base[i]);
+      for (const cid of el.children) walk(tree.elements.get(cid), M2);
+      if (el.type !== 'stem' && el.anchors) deformLoopTo(tree, el, out, ov[el.id]);
     };
 
-    const walkStem = (stem, M) => {
-      const M2 = localMatrix(stem, M);
-      paint(stem.residues, M2);
-      for (const lid of stem.children) walkLoop(tree.elements.get(lid), M2);
-    };
-
-    const walkLoop = (loop, M) => {
-      paint(loop.residues, M);
-      for (const sid of loop.children) walkStem(tree.elements.get(sid), M);
-      // 锚点（父/子 stem 的配对残基）此时都已定位，再做环形变
-      deformLoopTo(tree, loop, out, ov[loop.id]);
-    };
-
-    walkLoop(tree.elements.get(tree.rootId), IDENT);
+    walk(tree.elements.get(tree.rootId), IDENT);
     return out;
   }
 
