@@ -12,7 +12,17 @@
 CI 里会在调用本 spec 之前，用 jlink 在项目根目录生成 jre/，
 这里检测到就一并打进去（检测不到也能打包，只是 VARNA 出图需要系统 Java）。
 """
+# 构建日志强制 UTF-8：Windows 控制台默认是 cp1252，非 ASCII 字符会直接抛
+# UnicodeEncodeError 让整个打包失败（已踩过）。这里兜住，防止将来又写中文注释输出。
 import sys
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name, None)
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 from pathlib import Path
 
 # SPECPATH 是 spec 文件所在目录（packaging/），项目根在上一级
@@ -33,14 +43,14 @@ datas = [
 jre_dir = ROOT / "jre"
 if jre_dir.is_dir():
     datas.append((str(jre_dir), "jre"))
-    print(f"[spec] 捆绑精简 JRE：{jre_dir}")
+    print(f"[spec] bundling trimmed JRE: {jre_dir}")
 else:
-    print("[spec] 未发现 jre/，VARNA 出图将依赖用户机器上的 Java")
+    print("[spec] no jre/ found; VARNA export will rely on system Java")
 
 # RNAstructure 是可选引擎；如果构建机上装了，就一起带上
 rs_dir = ROOT / "vendor" / "RNAstructure"
 if rs_dir.is_dir():
-    print(f"[spec] 捆绑 RNAstructure：{rs_dir}")
+    print(f"[spec] bundling RNAstructure: {rs_dir}")
 
 # ───────────────────────── hidden imports ─────────────────────────
 
@@ -111,9 +121,9 @@ def _collect(pkg):
         datas_from_collect.extend(d)
         binaries_from_collect.extend(b)
         hiddenimports.extend(h)
-        print(f"[spec] collect_all({pkg}) 成功")
+        print(f"[spec] collect_all({pkg}) ok")
     except Exception as e:  # noqa: BLE001
-        print(f"[spec] 跳过 collect_all({pkg})：{e}")
+        print(f"[spec] skipped collect_all({pkg}): {e}")
 
 
 for pkg in ("ViennaRNA", "RNA", "webview", "uvicorn", "fastapi", "pydantic"):

@@ -22,6 +22,22 @@ BAD = "✗"
 failures: list[str] = []
 
 
+def _force_utf8_streams() -> None:
+    """Windows 上 stdout/stderr 默认用系统代码页（cp1252/cp936），
+    打印中文会抛 UnicodeEncodeError；打包成窗口程序时它们甚至可能是 None。
+    统一改成 UTF-8 + 出错不抛异常，保证任何一条日志都不会把程序打挂。"""
+    import sys as _s
+
+    for name in ("stdout", "stderr"):
+        stream = getattr(_s, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def check(label: str, cond: bool, extra: str = "") -> None:
     print(f"   {OK if cond else BAD} {label}{('  ' + extra) if extra else ''}")
     if not cond:
@@ -29,6 +45,7 @@ def check(label: str, cond: bool, extra: str = "") -> None:
 
 
 def main() -> int:
+    _force_utf8_streams()
     c = TestClient(app)
 
     print("=== /api/status ===")

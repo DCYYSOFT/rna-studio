@@ -31,6 +31,22 @@ WINDOW_W, WINDOW_H = 1440, 900
 MIN_W, MIN_H = 900, 600
 
 
+def _force_utf8_streams() -> None:
+    """Windows 上 stdout/stderr 默认用系统代码页（cp1252/cp936），
+    打印中文会抛 UnicodeEncodeError；打包成窗口程序时它们甚至可能是 None。
+    统一改成 UTF-8 + 出错不抛异常，保证任何一条日志都不会把程序打挂。"""
+    import sys as _s
+
+    for name in ("stdout", "stderr"):
+        stream = getattr(_s, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def free_port(preferred: int = 0) -> int:
     """要一个空闲端口。preferred 为 0 时由系统分配。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -158,6 +174,7 @@ def open_in_browser(url: str, reason: str = "") -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_streams()
     ap = argparse.ArgumentParser(description=f"{APP_NAME} 桌面版")
     ap.add_argument("--port", type=int, default=0, help="固定端口（默认自动选择空闲端口）")
     ap.add_argument("--browser", action="store_true", help="已废弃：无窗口后端时会自动回退到浏览器")
