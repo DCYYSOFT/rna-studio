@@ -33,7 +33,9 @@ const state = {
   status: null,
   view: { x: 0, y: 0, w: 100, h: 100 },
   fitPending: true,
-  readOnly: false,          // 只读预览：画布锁定，点击不修改配对
+  // 编辑模式是画布交互的唯一开关，取代了早先「只读开关 + 排版开关」两个独立状态——
+  // 那样会打架：排版模式下点两个碱基居然还会建立配对。
+  editMode: 'pair',         // preview | pair | sequence | arrange
   domains: [],              // 结构域标注 [{name, start, end, color}]，0-based 闭区间
   locatedRange: null,       // 序列定位的高亮区间 [start, end]
   pdbGaps: [],              // PDB 未解析出的区域 [[start,end],...]，用灰带标出
@@ -43,6 +45,11 @@ const state = {
   invalidPairs: new Set(),  // 非经典配对（PDB 导入或改碱基所致），标紫提示但不自动解除
   manualPoints: null,       // 手动拖动后的坐标；null 表示用后端给的自动布局
   arrange: false,           // 「调整排版」模式：拖动移动螺旋而不是平移画布
+  pickedBase: null,         // 选中单位里的任一个碱基（索引），用于在结构变化后重新定位
+  pickedUnit: null,         // 派生出来的选中单位 {kind, id, bases}
+  detached: null,           // Set<helixId>：已断开为自由图形的螺旋
+  snapGuides: [],           // 拖动时的对齐辅助线
+  suppressAnim: false,      // 交互拖动/旋转期间关掉折叠过渡动画，否则动画会和手势打架
   stripNodes: [],           // 序列条的字符节点缓存，按索引取用
   stripHot: null,           // 序列条上当前高亮的字符
   canvasHot: null,          // 画布上因悬停序列条而高亮的碱基
@@ -73,7 +80,7 @@ const el = {
   bpstyleWrap: $('bpstyle-wrap'), bpstyle: $('bpstyle'), periodNum: $('period-num'),
   btnSvg: $('btn-svg'), svgScope: $('svg-scope'),
   btnUndo: $('btn-undo'), btnRedo: $('btn-redo'),
-  btnReadOnly: $('btn-readonly'), readonlyBanner: $('readonly-banner'),
+  editMode: $('edit-mode'), readonlyBanner: $('readonly-banner'),
   btnCompare: $('btn-compare'), compareOverlay: $('compare-overlay'),
   compareLeft: $('compare-left'), compareRight: $('compare-right'),
   compareLeftDg: $('compare-left-dg'), compareRightDg: $('compare-right-dg'),
@@ -93,7 +100,8 @@ const el = {
   bindingList: $('binding-list'),
   stripBody: $('seq-strip-body'), stripHint: $('seq-strip-hint'),
   btnStripToggle: $('btn-strip-toggle'), seqStrip: $('seq-strip'),
-  btnArrange: $('btn-arrange'), arrangeBanner: $('arrange-banner'),
+  arrangeBanner: $('arrange-banner'),
+  arrangeSel: $('arrange-sel'),
   btnRestoreLayout: $('btn-restore-layout'),
   baseEditor: $('base-editor'), baseEditorPos: $('base-editor-pos'),
   baseEditorCur: $('base-editor-cur'), baseEditorBtns: $('base-editor-btns'),
@@ -756,17 +764,18 @@ function render() {
     ? { ...state.result.layout, points: state.manualPoints }
     : state.result.layout;
 
+  if (state.suppressAnim) state.lastRenderedPoints = null;
   const geo = drawStructure(el.canvas, {
     sequence: state.sequence,
     layout: layoutForDraw,
     pairs: state.pairs,
-    breaks: state.breaks,
+    breaks: allBreaks(),
     forbidden: state.forbidden,
     selected: state.selection,
     colorMap: colorValues(),
     period: parseInt(el.periodNum.value, 10) || 0,
     bands: activeBands(),
-    interactive: !state.readOnly,
+    interactive: !isReadOnly(),
     colorRamp: state.colorMode === 'rainbow' ? rainbowColor : null,
     bpStyle: el.bpStyleDraw ? el.bpStyleDraw.value : '',
     invalidPairs: state.invalidPairs,
@@ -781,6 +790,13 @@ function render() {
 
   // 折叠过渡动画：让碱基从上一帧的位置弹性地滑到新位置。
   // 若位置没有实质变化（如只是切换配色）就跳过，免得白跑一遍。
+  // 排版模式下叠加选择框与对齐辅助线（画在结构之上）
+  if (isArrange() && !isReadOnly()) {
+    if (state.pickedBase != null) state.pickedUnit = pickUnit(state.pickedBase);
+    drawSelectionOverlay(el.canvas, layoutForDraw.points, geo.r);
+    drawSnapGuides(el.canvas, geo.r, layoutForDraw.bounds.span);
+  }
+
   const newPts = layoutForDraw.points;
   const prevPts = state.lastRenderedPoints;
   let moved = false;
@@ -791,7 +807,7 @@ function render() {
       }
     }
   }
-  if (moved) {
+  if (moved && !state.suppressAnim) {
     animateFold(el.canvas, prevPts, newPts, state.lastRenderedPairs, state.pairs);
   }
   state.lastRenderedPoints = newPts.map((q) => ({ x: q.x, y: q.y }));
@@ -805,6 +821,24 @@ function applyViewBox() {
 }
 
 /* ───────────────────────── 悬停 / 点击 ───────────────────────── */
+
+/**
+ * 只更新选中的高亮类，不重建 SVG。
+ *
+ * 为什么不能直接 render()：重建会把碱基元素全部换掉，双击的第二次点击
+ * 落到已经被移除的旧节点上，浏览器就不再派发 dblclick —— 表现为「双击没反应」。
+ */
+function applySelectionClasses() {
+  const svg = el.canvas;
+  const pm = pairMap();
+  const sel = state.selection;
+  const partner = sel != null ? pm.get(sel) : undefined;
+  svg.querySelectorAll('.nt').forEach((g) => {
+    const i = Number(g.dataset.i);
+    g.classList.toggle('is-selected', i === sel);
+    g.classList.toggle('is-partnered', partner != null && i === partner);
+  });
+}
 
 function baseFromEvent(ev) {
   const t = ev.target;
@@ -838,7 +872,14 @@ let editTimer = null;
 function onCanvasClick(ev) {
   const i = baseFromEvent(ev);
   if (i == null) return;
-  if (state.readOnly) { toast('只读预览中，先退出再编辑'); return; }   // 防误改
+  if (isReadOnly()) { toast('仅预览模式下画布已锁定，先切换编辑模式'); return; }
+  if (isArrange()) return;      // 排版模式的选中在 pointerdown 里处理，这里不参与配对
+  if (state.editMode === 'sequence') {
+    // 改序列模式：单击只做高亮定位，不建立配对（避免误操作）
+    state.selection = i;
+    applySelectionClasses();
+    return;
+  }
 
   if (ev.altKey || ev.shiftKey) {
     if (state.forbidden.has(i)) state.forbidden.delete(i);
@@ -856,12 +897,12 @@ function onCanvasClick(ev) {
 
   if (state.selection == null) {
     state.selection = i;
-    render();
+    applySelectionClasses();
     return;
   }
   if (state.selection === i) {
     state.selection = null;
-    render();
+    applySelectionClasses();
     return;
   }
 
@@ -884,7 +925,8 @@ function onCanvasContext(ev) {
   const i = baseFromEvent(ev);
   if (i == null) return;
   ev.preventDefault();
-  if (state.readOnly) { toast('只读预览中，先退出再编辑'); return; }
+  if (isReadOnly()) { toast('仅预览模式下画布已锁定，先切换编辑模式'); return; }
+  if (isArrange() || state.editMode === 'sequence') return;   // 只在改配对模式生效
 
   const partner = pairMap().get(i);
   const before = state.pairs.length;
@@ -946,9 +988,36 @@ function setupCanvasInteraction() {
   let panning = null;
   let arrangeDrag = null;
 
+  let rotateDrag = null;
+
   el.canvasScroll.addEventListener('pointerdown', (ev) => {
+    // 旋转手柄优先于一切：它画在碱基之上，不拦的话会被当成拖动
+    if (isArrange() && !isReadOnly()
+        && ev.target && ev.target.dataset && ev.target.dataset.role === 'rotate') {
+      const u = state.pickedUnit;
+      const pts = currentPoints();
+      if (u && pts) {
+        if (!state.manualPoints) {
+          state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
+        }
+        const m = screenToModel(ev.clientX, ev.clientY);
+        const c = unitCenter(u, state.manualPoints);
+        const origPts = {};
+        for (const b of u.bases) origPts[b] = { x: state.manualPoints[b].x, y: state.manualPoints[b].y };
+        rotateDrag = {
+          unit: u, center: c, origPts,
+          startAng: Math.atan2(m.y - c.y, m.x - c.x),
+          scale: m.scale, total: 0, snapped: false, moved: false,
+        };
+        state.suppressAnim = true;
+        el.canvasScroll.setPointerCapture(ev.pointerId);
+        ev.preventDefault();
+        return;
+      }
+    }
+
     // 调整排版模式：拖碱基 = 移动它所在的螺旋/环
-    if (state.arrange && !state.readOnly) {
+    if (isArrange() && !isReadOnly()) {
       const unit = baseFromEvent(ev);
       if (unit != null) {
         const rect = el.canvas.getBoundingClientRect();
@@ -957,6 +1026,12 @@ function setupCanvasInteraction() {
         if (!state.manualPoints && state.result && state.result.layout) {
           state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
         }
+        // 点中某个碱基 = 选中它所在的单位，然后可以拖着走
+        state.pickedBase = unit;
+        state.pickedUnit = pickUnit(unit);
+        state.snapGuides = [];
+        updateArrangeBanner();
+        render();          // 必须重绘，否则单击后选择框不会出现
         arrangeDrag = { base: unit, x: ev.clientX, y: ev.clientY, scale, moved: false };
         el.canvasScroll.setPointerCapture(ev.pointerId);
         ev.preventDefault();
@@ -964,6 +1039,11 @@ function setupCanvasInteraction() {
       }
     }
     if (baseFromEvent(ev)) return;
+    // 排版模式下点空白处 = 取消选中
+    if (isArrange() && state.pickedBase != null) {
+      state.pickedBase = null; state.pickedUnit = null; state.snapGuides = [];
+      updateArrangeBanner(); render();
+    }
     const rect = el.canvas.getBoundingClientRect();
     const v = state.view;
     const scale = Math.min(rect.width / v.w, rect.height / v.h);
@@ -972,14 +1052,47 @@ function setupCanvasInteraction() {
     el.canvasScroll.setPointerCapture(ev.pointerId);
   });
   el.canvasScroll.addEventListener('pointermove', (ev) => {
+    if (rotateDrag) {
+      const pts = state.manualPoints;
+      const m = screenToModel(ev.clientX, ev.clientY);
+      let total = Math.atan2(m.y - rotateDrag.center.y, m.x - rotateDrag.center.x)
+        - rotateDrag.startAng;
+      // 每 15° 吸附，抖动小于约 4° 时吸住
+      const SNAP = Math.PI / 12;
+      const nearest = Math.round(total / SNAP) * SNAP;
+      rotateDrag.snapped = Math.abs(total - nearest) < 0.07;
+      if (rotateDrag.snapped) total = nearest;
+      rotateDrag.total = total;
+      rotateDrag.moved = true;
+
+      rotateBases(rotateDrag.unit.bases, rotateDrag.center, total, rotateDrag.origPts, pts);
+      relaxAfterUnit(rotateDrag.unit, pts);
+      refreshManualBounds();
+      state.fitPending = false;
+      render();
+
+      const deg = (total * 180 / Math.PI).toFixed(1);
+      el.hoverReadout.textContent = `旋转 ${deg}°` + (rotateDrag.snapped ? '　已吸附到 15° 的整数倍' : '');
+      el.hoverReadout.classList.add('is-on');
+      return;
+    }
     if (arrangeDrag) {
-      const dx = (ev.clientX - arrangeDrag.x) / arrangeDrag.scale;
-      const dy = (ev.clientY - arrangeDrag.y) / arrangeDrag.scale;
+      let dx = (ev.clientX - arrangeDrag.x) / arrangeDrag.scale;
+      let dy = (ev.clientY - arrangeDrag.y) / arrangeDrag.scale;
       if (dx || dy) {
+        // 与其他单位对齐则吸附，并留下辅助线
+        const pts0 = currentPoints();
+        const span = (state.result && state.result.layout)
+          ? state.result.layout.bounds.span : 100;
+        if (state.pickedUnit && pts0) {
+          const snap = applySnap(state.pickedUnit, pts0, dx, dy, span);
+          dx = snap.dx; dy = snap.dy; state.snapGuides = snap.guides;
+        }
         moveUnit(arrangeDrag.base, dx, dy);
         arrangeDrag.x = ev.clientX;
         arrangeDrag.y = ev.clientY;
         arrangeDrag.moved = true;
+        state.suppressAnim = true;
         refreshManualBounds();
         state.fitPending = false;
         render();
@@ -992,9 +1105,20 @@ function setupCanvasInteraction() {
     applyViewBox();
   });
   const endPan = (ev) => {
+    if (rotateDrag) {
+      const moved = rotateDrag.moved;
+      rotateDrag = null;
+      state.suppressAnim = false;
+      el.hoverReadout.classList.remove('is-on');
+      try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
+      if (moved) { pushHistory('旋转螺旋'); saveSession(); }
+      return;
+    }
     if (arrangeDrag) {
       const moved = arrangeDrag.moved;
       arrangeDrag = null;
+      state.suppressAnim = false;
+      state.snapGuides = [];
       try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
       if (moved) {
         pushHistory('调整排版');
@@ -1648,6 +1772,7 @@ function bindEvents() {
   el.stripBody.addEventListener('dblclick', (ev) => {
     const ch = ev.target.closest('.ss-char');
     if (!ch) return;
+    if (state.editMode !== 'sequence') { toast('双击改序列需先切到「改序列」模式'); return; }
     ev.preventDefault();
     state.selection = +ch.dataset.i;
     render();
@@ -1661,15 +1786,15 @@ function bindEvents() {
   // 结构图上双击碱基也能改
   el.canvas.addEventListener('dblclick', (ev) => {
     const i = baseFromEvent(ev);
-    if (i == null || state.readOnly) return;
+    if (i == null || isReadOnly()) return;
+    if (state.editMode !== 'sequence') return;   // 只在改序列模式生效
     ev.preventDefault();
     state.selection = i;
-    render();
+    applySelectionClasses();                     // 不能 render()，否则元素被换掉
     openBaseEditor(i, ev.target);
   });
 
   // ── 调整排版 ──
-  el.btnArrange.addEventListener('click', () => setArrange(!state.arrange));
   el.btnRestoreLayout.addEventListener('click', restoreAutoLayout);
 
   // ── 从 PDB 导入 ──
@@ -1740,7 +1865,9 @@ function bindEvents() {
   el.btnRedo.addEventListener('click', redo);
 
   // ── 只读预览 / 对照预览 ──
-  el.btnReadOnly.addEventListener('click', () => setReadOnly(!state.readOnly));
+  el.editMode.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => setEditMode(b.dataset.edit));
+  });
   el.btnCompare.addEventListener('click', () => {
     if (el.compareOverlay.hidden) void openCompare();
     else closeCompare();
@@ -1774,6 +1901,10 @@ function bindEvents() {
 
     if (ev.key === 'Escape') {
       if (!el.compareOverlay.hidden) { closeCompare(); return; }
+      if (isArrange() && (state.pickedBase != null || state.snapGuides.length)) {
+        state.pickedBase = null; state.pickedUnit = null; state.snapGuides = [];
+        updateArrangeBanner(); render(); return;
+      }
       if (!el.exportDialog.open && state.selection != null) { state.selection = null; render(); }
       return;
     }
@@ -1935,15 +2066,6 @@ function renderHistory() {
 
 /* ═══════════════════════════ 只读预览 ═══════════════════════════ */
 
-function setReadOnly(on) {
-  state.readOnly = !!on;
-  el.btnReadOnly.setAttribute('aria-pressed', String(state.readOnly));
-  el.btnReadOnly.classList.toggle('is-on', state.readOnly);
-  el.readonlyBanner.hidden = !state.readOnly;
-  el.canvasScroll.classList.toggle('is-readonly', state.readOnly);
-  render();
-  toast(state.readOnly ? '已进入只读预览，画布已锁定' : '已退出只读预览，可以继续编辑');
-}
 
 /* ═══════════════════════ 出图预览对话框 ═══════════════════════ */
 
@@ -2743,6 +2865,7 @@ function collectSession() {
     layout: el.layout.value,
     temperature: el.temperature.value,
     colorMode: el.colorMode.value,
+    editMode: state.editMode,
     period: el.periodNum.value,
     svgScope: el.svgScope.value,
     bpStyleDraw: el.bpStyleDraw ? el.bpStyleDraw.value : '',
@@ -2794,6 +2917,7 @@ function restoreSession() {
   if (d.layout) { el.layout.value = d.layout; state.layout = d.layout; }
   if (d.temperature != null) el.temperature.value = d.temperature;
   if (d.colorMode) el.colorMode.value = d.colorMode;
+  if (d.editMode) state.editMode = d.editMode;
   if (d.period != null) el.periodNum.value = d.period;
   if (d.svgScope) el.svgScope.value = d.svgScope;
   if (d.bpStyleDraw && el.bpStyleDraw) el.bpStyleDraw.value = d.bpStyleDraw;
@@ -3360,19 +3484,37 @@ function refreshManualBounds() {
   };
 }
 
-function setArrange(on) {
-  state.arrange = !!on;
-  el.btnArrange.classList.toggle('is-on', state.arrange);
-  el.btnArrange.setAttribute('aria-pressed', String(state.arrange));
-  el.arrangeBanner.hidden = !state.arrange;
-  el.canvasScroll.classList.toggle('is-arranging', state.arrange);
-  if (state.arrange) {
+
+/** 切换编辑模式：画布上的一切交互都由它决定 */
+function setEditMode(mode) {
+  const MODES = ['preview', 'pair', 'sequence', 'arrange'];
+  if (!MODES.includes(mode)) return;
+  state.editMode = mode;
+
+  el.editMode.querySelectorAll('button').forEach((b) => {
+    b.classList.toggle('is-on', b.dataset.edit === mode);
+  });
+  el.readonlyBanner.hidden = mode !== 'preview';
+  el.arrangeBanner.hidden = mode !== 'arrange';
+  el.canvasScroll.classList.toggle('is-readonly', mode === 'preview');
+  el.canvasScroll.classList.toggle('is-arranging', mode === 'arrange');
+
+  if (mode !== 'arrange') {
+    state.pickedBase = null; state.pickedUnit = null; state.snapGuides = [];
+  } else if (!state.manualPoints && state.result && state.result.layout) {
     // 进入排版模式时先固化当前坐标，之后拖的是这一份
-    if (!state.manualPoints && state.result && state.result.layout) {
-      state.manualPoints = state.result.layout.points.map((p) => ({ ...p }));
-    }
-    toast('调整排版：拖动螺旋可移动它，相连的环会跟着变形');
+    state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
   }
+  updateArrangeBanner();
+  render();
+
+  const hint = {
+    preview: '仅预览：画布已锁定，切换模式才能编辑',
+    pair: '改配对：点两个碱基建立配对，右键解除',
+    sequence: '改序列：双击碱基替换字母',
+    arrange: '排版：单击选中螺旋或环，拖动平移、拖圆点旋转',
+  }[mode];
+  if (hint) toast(hint);
 }
 
 function restoreAutoLayout() {
@@ -3594,6 +3736,281 @@ async function pdbDoImport() {
   toast(`已导入 ${d.n_pairs} 个配对`);
 }
 
+/* ═══════════════ 对象选中 / 旋转 / 对齐吸附（BioRender 式交互） ═══════════════
+   与 VARNA 那种「逐碱基编辑」不同，这里是按**对象**操作：单击选中一个螺旋或环，
+   出现选择框与旋转手柄，拖动旋转、拖动平移，并带对齐辅助线。
+   对象是真实配对算出来的，所以旋转不会破坏碱基配对。 */
+
+/** 把画布屏幕坐标换算成模型坐标（与缩放/平移保持一致） */
+function screenToModel(clientX, clientY) {
+  const rect = el.canvas.getBoundingClientRect();
+  const v = state.view;
+  const scale = Math.min(rect.width / v.w, rect.height / v.h) || 1;
+  const offX = (rect.width - v.w * scale) / 2;
+  const offY = (rect.height - v.h * scale) / 2;
+  return {
+    x: v.x + (clientX - rect.left - offX) / scale,
+    y: v.y + (clientY - rect.top - offY) / scale,
+    scale,
+  };
+}
+
+const isReadOnly = () => state.editMode === 'preview';
+const isArrange = () => state.editMode === 'arrange';
+
+function currentPoints() {
+  if (state.manualPoints) return state.manualPoints;
+  const L = state.result && state.result.layout;
+  return L ? L.points : null;
+}
+
+/** 取某个碱基所属的「单位」：螺旋或环 */
+function pickUnit(baseIdx) {
+  const { baseToHelix, runs } = computeHelices(state.pairs);
+  const hid = baseToHelix.get(baseIdx);
+  if (hid != null) {
+    const bases = new Set();
+    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
+    return { kind: 'helix', id: hid, bases, run: runs[hid] };
+  }
+  const L = computeLoops(state.sequence.length, state.pairs)
+    .find((l) => l.bases.includes(baseIdx));
+  if (!L) return null;
+  return { kind: 'loop', id: `loop-${L.start}`, bases: new Set(L.bases), loop: L };
+}
+
+function unitCenter(u, pts) {
+  let x = 0; let y = 0;
+  for (const b of u.bases) { x += pts[b].x; y += pts[b].y; }
+  return { x: x / u.bases.size, y: y / u.bases.size };
+}
+
+function unitBounds(u, pts) {
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  for (const b of u.bases) {
+    minX = Math.min(minX, pts[b].x); maxX = Math.max(maxX, pts[b].x);
+    minY = Math.min(minY, pts[b].y); maxY = Math.max(maxY, pts[b].y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+/** 断开后不再被相邻环牵引的螺旋集合 */
+function detachedSet() {
+  if (!state.detached) state.detached = new Set();
+  return state.detached;
+}
+
+/** 断开产生的骨架断点：螺旋的碱基与非螺旋碱基相邻的每一处 */
+function detachedBreaks() {
+  const out = [];
+  const det = detachedSet();
+  if (!det.size) return out;
+  const { baseToHelix, runs } = computeHelices(state.pairs);
+  const n = state.sequence.length;
+  for (const hid of det) {
+    if (!runs[hid]) continue;
+    const bases = new Set();
+    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
+    for (let b = 0; b < n - 1; b++) {
+      const a = bases.has(b); const c = bases.has(b + 1);
+      if (a !== c) out.push(b);            // 一端在螺旋内、一端在外 → 断开
+    }
+  }
+  return out;
+}
+
+/** 显示用的全部断点 = 后端给的（如共折叠的链间断点）+ 手动断开 */
+function allBreaks() {
+  const s = new Set(state.breaks || []);
+  for (const b of detachedBreaks()) s.add(b);
+  return [...s];
+}
+
+/* ── 选择框与旋转手柄 ── */
+
+function drawSelectionOverlay(svg, pts, r) {
+  const u = state.pickedUnit;
+  if (!u || !pts) { state.selBox = null; return; }
+  const g = mk('g', { class: 'sel-layer' });
+
+  for (const b of u.bases) {
+    if (!pts[b]) continue;
+    g.appendChild(mk('circle', {
+      class: 'sel-ring', cx: pts[b].x, cy: pts[b].y, r: r * 1.5,
+      fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.20,
+      'stroke-dasharray': `${r * 0.45} ${r * 0.32}`,
+    }));
+  }
+
+  const bb = unitBounds(u, pts);
+  const pad = r * 2.0;
+  const bx = bb.minX - pad; const by = bb.minY - pad;
+  const bw = (bb.maxX - bb.minX) + pad * 2; const bh = (bb.maxY - bb.minY) + pad * 2;
+  g.appendChild(mk('rect', {
+    class: 'sel-box', x: bx, y: by, width: bw, height: bh,
+    fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.15,
+    'stroke-dasharray': `${r * 0.9} ${r * 0.55}`,
+  }));
+
+  // 旋转手柄：从选择框上边中间伸出一根小杆 + 一个圆点
+  const hx = bx + bw / 2; const hy = by - r * 3.4;
+  g.appendChild(mk('line', {
+    class: 'sel-stem', x1: hx, y1: by, x2: hx, y2: hy,
+    stroke: '#2F6FB5', 'stroke-width': r * 0.15,
+  }));
+  g.appendChild(mk('circle', {
+    class: 'sel-handle', 'data-role': 'rotate',
+    cx: hx, cy: hy, r: r * 1.15,
+    fill: '#ffffff', stroke: '#2F6FB5', 'stroke-width': r * 0.22,
+  }));
+  g.appendChild(mk('path', {
+    d: `M ${hx - r * 0.5} ${hy} a ${r * 0.5} ${r * 0.5} 0 1 1 ${r * 0.7} ${r * 0.35}`,
+    fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.18, 'pointer-events': 'none',
+  }));
+
+  state.selBox = { bx, by, bw, bh, hx, hy };
+  svg.appendChild(g);
+}
+
+/** 对齐辅助线 */
+function drawSnapGuides(svg, r, span) {
+  const gd = state.snapGuides;
+  if (!gd || (!gd.length)) return;
+  const g = mk('g', { class: 'snap-layer' });
+  for (const item of gd) {
+    if (item.axis === 'x') {
+      g.appendChild(mk('line', {
+        class: 'snap-line', x1: item.at, y1: item.from, x2: item.at, y2: item.to,
+        stroke: '#D2912A', 'stroke-width': r * 0.16, 'stroke-dasharray': `${r * 0.7} ${r * 0.5}`,
+      }));
+    } else {
+      g.appendChild(mk('line', {
+        class: 'snap-line', x1: item.from, y1: item.at, x2: item.to, y2: item.at,
+        stroke: '#D2912A', 'stroke-width': r * 0.16, 'stroke-dasharray': `${r * 0.7} ${r * 0.5}`,
+      }));
+    }
+  }
+  svg.appendChild(g);
+  void span;
+}
+
+/* ── 旋转 ── */
+
+/**
+ * 绕质心旋转一组碱基。
+ * 从**起始快照**整体应用累计角度，而不是逐帧累加增量——否则每帧的浮点误差
+ * 会累积，转一圈回来位置就对不上了。
+ */
+function rotateBases(bases, center, theta, origPts, pts) {
+  const cos = Math.cos(theta); const sin = Math.sin(theta);
+  for (const b of bases) {
+    const o = origPts[b];
+    if (!o) continue;
+    const dx = o.x - center.x; const dy = o.y - center.y;
+    pts[b].x = center.x + dx * cos - dy * sin;
+    pts[b].y = center.y + dx * sin + dy * cos;
+  }
+}
+
+/** 旋转后把相连的环重新铺开（已断开的螺旋跳过，那正是「自由摆放」的含义） */
+function relaxAfterUnit(unit, pts) {
+  if (unit.kind === 'helix' && detachedSet().has(unit.id)) return;
+  const n = state.sequence.length;
+  let cx = 0; let cy = 0;
+  for (const p of pts) { cx += p.x; cy += p.y; }
+  const centroid = { x: cx / n, y: cy / n };
+  const spacing = typicalSpacing(pts, n);
+  for (const L of computeLoops(n, state.pairs)) {
+    if ((L.anchor5 != null && unit.bases.has(L.anchor5))
+        || (L.anchor3 != null && unit.bases.has(L.anchor3))) {
+      relayoutLoop(L, pts, centroid, spacing);
+    }
+  }
+}
+
+/** 拖动时与其他单位对齐则吸附，并返回辅助线 */
+function applySnap(u, pts, dx, dy, span) {
+  const guides = [];
+  const thr = span * 0.015;
+  const c = unitCenter(u, pts);
+  const target = { x: c.x + dx, y: c.y + dy };
+
+  const others = [];
+  const { runs, baseToHelix } = computeHelices(state.pairs);
+  const seen = new Set();
+  for (let b = 0; b < state.sequence.length; b++) {
+    const hid = baseToHelix.get(b);
+    if (hid == null || seen.has(hid)) continue;
+    seen.add(hid);
+    const bases = new Set();
+    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
+    if (bases.size === u.bases.size && [...bases].every((x) => u.bases.has(x))) continue;
+    others.push(unitCenter({ bases }, pts));
+  }
+
+  let bx = null; let by = null; let bestX = thr; let bestY = thr;
+  for (const o of others) {
+    const ddx = Math.abs(target.x - o.x);
+    if (ddx < bestX) { bestX = ddx; bx = o.x; }
+    const ddy = Math.abs(target.y - o.y);
+    if (ddy < bestY) { bestY = ddy; by = o.y; }
+  }
+  let adx = dx; let ady = dy;
+  if (bx != null) {
+    adx += bx - target.x;
+    guides.push({ axis: 'x', at: bx, from: -1e5, to: 1e5 });
+  }
+  if (by != null) {
+    ady += by - target.y;
+    guides.push({ axis: 'y', at: by, from: -1e5, to: 1e5 });
+  }
+  return { dx: adx, dy: ady, guides };
+}
+
+/** 选中态变化时更新横幅提示 */
+function updateArrangeBanner() {
+  const u = state.pickedUnit;
+  const box = el.arrangeSel;
+  if (!box) return;
+  if (!u) {
+    box.innerHTML = '<span class="arrange-dim">单击一个螺旋或环即可选中它</span>';
+    return;
+  }
+  const n = u.bases.size;
+  const isDet = u.kind === 'helix' && detachedSet().has(u.id);
+  box.innerHTML =
+    `<b>已选中</b> ${u.kind === 'helix' ? '螺旋' : '环'}（${n} 个碱基）`
+    + `<span class="arrange-sep">·</span>拖动本体可平移`
+    + `<span class="arrange-sep">·</span>拖上方圆点可旋转`
+    + (u.kind === 'helix'
+      ? `<span class="arrange-sep">·</span><button class="link-btn" id="btn-detach" type="button">`
+        + (isDet ? '重新连接' : '断开为自由图形') + '</button>'
+      : '')
+    + `<span class="arrange-sep">·</span><button class="link-btn" id="btn-unpick" type="button">取消选中</button>`;
+
+  const det = document.getElementById('btn-detach');
+  if (det) det.onclick = toggleDetach;
+  const unp = document.getElementById('btn-unpick');
+  if (unp) unp.onclick = () => { state.pickedUnit = null; state.snapGuides = []; render(); updateArrangeBanner(); };
+}
+
+/** 断开 / 重新连接选中螺旋 */
+function toggleDetach() {
+  const u = state.pickedUnit;
+  if (!u || u.kind !== 'helix') return;
+  const det = detachedSet();
+  if (det.has(u.id)) {
+    det.delete(u.id);
+    toast('已重新连接，相邻的环会重新贴上来');
+  } else {
+    det.add(u.id);
+    toast('已断开为自由图形：移动旋转不再牵引相邻的环。碱基配对保持不变。');
+  }
+  render();
+  updateArrangeBanner();
+  pushHistory(det.has(u.id) ? '断开螺旋' : '重新连接螺旋');
+}
+
 /* ─────────────────────────── 启动 ─────────────────────────── */
 
 async function init() {
@@ -3627,6 +4044,7 @@ async function init() {
   renderDomains();
   renderSeqStrip();
   renderBindingSites();
+  setEditMode(state.editMode);   // 同步模式按钮的选中态
 
   // 关闭/刷新前补存一次，免得最后一步改动没落盘
   window.addEventListener('beforeunload', () => {

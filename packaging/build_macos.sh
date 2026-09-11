@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 APP_NAME="RNA Studio"
-VERSION="0.0.5"
+VERSION="0.0.6"
 OUT="$ROOT/release"
 
 echo "==> 项目目录：$ROOT"

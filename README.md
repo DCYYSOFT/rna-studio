@@ -10,8 +10,8 @@
 
 | 你的系统 | 安装包 | 打开方式 |
 |---|---|---|
-| macOS（Apple Silicon） | [RNA-Studio-0.0.5-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.5/RNA-Studio-0.0.5-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | [RNA-Studio-0.0.5-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.5/RNA-Studio-0.0.5-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+| macOS（Apple Silicon） | [RNA-Studio-0.0.6-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.6/RNA-Studio-0.0.6-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-0.0.6-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.6/RNA-Studio-0.0.6-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
 
 全部版本见 [Releases](../../releases)。
 
