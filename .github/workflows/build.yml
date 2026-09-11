@@ -112,13 +112,23 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: 构建 exe 与 zip
-        shell: powershell
+      - name: 校验脚本编码（缺 BOM 会让中文乱码并导致解析失败）
+        shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+          $bytes = [System.IO.File]::ReadAllBytes("packaging/build_windows.ps1")
+          if ($bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+            Write-Error "build_windows.ps1 缺少 UTF-8 BOM"
+            exit 1
+          }
+          Write-Host "编码检查通过"
+
+      - name: 构建 exe 与 zip
+        shell: pwsh
+        run: |
+          ./packaging/build_windows.ps1
 
       - name: 冒烟测试（确认打包产物能启动后端）
-        shell: powershell
+        shell: pwsh
         run: |
           $exe = "dist\RNA Studio\RNA Studio.exe"
           if (-not (Test-Path $exe)) { Write-Error "找不到可执行文件"; exit 1 }

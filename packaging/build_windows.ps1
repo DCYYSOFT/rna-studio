@@ -1,4 +1,4 @@
-# 在 Windows 上构建 RNA Studio.exe 并打成 zip 分发包
+﻿# 在 Windows 上构建 RNA Studio.exe 并打成 zip 分发包
 #
 # 前置条件（本机需联网）：
 #   · Python 3.9+（安装时勾选 "Add python.exe to PATH"）
@@ -10,6 +10,11 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 # 产物：  dist\RNA Studio\RNA Studio.exe
 #         以及 release\RNA-Studio-<版本>-Windows-x64.zip
+
+# 注意：本文件必须保存为「带 UTF-8 BOM」的编码。
+# Windows PowerShell 5.1 在没有 BOM 时会按系统 ANSI 代码页读取脚本，
+# 导致下面的中文字符串变成乱码、脚本直接解析失败（已踩过这个坑）。
+# 用 VS Code 保存时选「UTF-8 with BOM」，或用编辑器保留现有 BOM。
 
 $ErrorActionPreference = "Stop"
 
