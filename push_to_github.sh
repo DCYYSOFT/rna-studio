@@ -173,4 +173,4 @@ echo "    大约 5–10 分钟后，在 Actions 页面那次运行的底部"
 echo "    Artifacts 区域就能下载两个安装包。"
 echo
 echo "    想让安装包挂到 Releases 上方便分享，之后再执行："
-echo "      git tag v0.0.6 && git push origin v0.0.6"
+echo "      git tag v0.0.7 && git push origin v0.0.7"

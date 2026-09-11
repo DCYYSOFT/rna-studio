@@ -10,8 +10,8 @@
 
 | 你的系统 | 安装包 | 打开方式 |
 |---|---|---|
-| macOS（Apple Silicon） | [RNA-Studio-0.0.6-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.6/RNA-Studio-0.0.6-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
-| Windows 64 位 | [RNA-Studio-0.0.6-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.6/RNA-Studio-0.0.6-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
+| macOS（Apple Silicon） | [RNA-Studio-0.0.7-macOS-arm64.dmg](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.7/RNA-Studio-0.0.7-macOS-arm64.dmg) | 拖进「应用程序」，**首次右键→打开** |
+| Windows 64 位 | [RNA-Studio-0.0.7-Windows-x64.zip](https://github.com/DCYYSOFT/rna-studio/releases/download/v0.0.7/RNA-Studio-0.0.7-Windows-x64.zip) | 解压后双击 `RNA Studio.exe` |
 
 全部版本见 [Releases](../../releases)。
 
@@ -109,8 +109,9 @@ python desktop.py        # 以原生窗口方式启动（需先装 requirements-
 ### 排版模式（按结构树编辑）
 
 结构关系全部来自配对表（不看屏幕坐标）：配对表会被解析成一棵**结构树**
-（stem / hairpin / internal loop / bulge / junction）。假结不参与建树，
-仍按红色虚线叠加显示。
+（stem / hairpin / internal loop / bulge / junction）。假结按**层级**组织
+（PK1、PK2…），可以像普通茎一样选中与旋转；超过 4 层的配对仍按红色虚线
+叠加显示。
 
 **单击一个 stem 上的任意碱基 = 选中整个分支**：stem 本体高亮、下游子树淡色
 高亮，并显示**旋转中心**（stem 与上层环的连接点，琥珀色十字）和旋转轨迹：
@@ -126,7 +127,12 @@ python desktop.py        # 以原生窗口方式启动（需先装 requirements-
 重新绘图、刷新页面都会恢复；重新折叠或切换布局后仍会叠加在新的自动布局上。
 点「恢复自动布局」可全部还原。
 
-> 环（hairpin 等）当前支持选中高亮，环本身的形变（半径 / 朝向）在后续版本提供。
+**单击环**（hairpin / internal loop / bulge / junction）：拖绿色圆点调整
+**鼓出**（径向）与**朝向**（角向，仅发夹环），环的两端锚点（闭合配对）不动、
+只重铺环内残基；双击或右键重置形状。
+
+拖动结束时会自动做**重叠检测**：若分支与其它部分压在一起，沿最小位移自动
+推开；避不开时放回原处——不会把重叠留在画面上。
 
 **断开为自由图形**：在该段两端打断骨架，从此移动旋转不再牵引相邻的环
 （**碱基配对与序列完全不变**），随时可「重新连接」还原。
@@ -320,7 +326,8 @@ Illustrator / Inkscape 编辑；PNG 是 3 倍超采样，适合放进 PPT 或文
 
 ## 几个容易踩的点
 
-**假结**：含假结的结构**能正常排版和编辑**，交叉的配对用红色虚线标出。
+**假结**：含假结的结构**能正常排版和编辑**，交叉的配对用红色虚线标出，
+假结本身也按 PK1、PK2… 分层建树，可选中与旋转（见「排版模式」）。
 但 ViennaRNA 的近邻热力学模型不支持假结，所以这种结构**算不出 ΔG** ——
 这是模型的固有限制，不是程序的问题。想算 ΔG 就解除交叉的其中一对。
 

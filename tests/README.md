@@ -37,3 +37,11 @@ node tests/structure.test.mjs
 覆盖：分支选择（pivot / 子树高亮 / 旋转手柄）、子树刚体旋转、非子树逐点不动、
 Shift 15° 吸附、双击重置角度、右键重置分支、刚体平移、撤销逐步还原（Case 4）、
 结构完整性 + 旋转期间零 API 调用（Case 5）、刷新后 layoutOverrides 恢复。
+
+其余 UI 套件（前置条件相同）：
+
+```bash
+node tests/ui-loops.mjs     # 环形变：鼓出 / 朝向、锚点不动、重置、持久化
+node tests/ui-collide.mjs   # 碰撞自动避让：拖到其它分支上松手 → 重叠清零
+node tests/ui-pk.mjs        # 假结层级：PK1 选中 / 旋转 / 刚体
+```
