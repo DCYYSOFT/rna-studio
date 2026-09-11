@@ -328,6 +328,59 @@ function distToLine(p, a, b) {
   ok(prL2.kept[loopId].bulge === 1.5 && prL2.kept[loopId].tilt === 20, 'L prune：环条目保留');
 }
 
+/* ═══════════ 碰撞检测与自动避让 ═══════════ */
+{
+  const n = 40;
+  const pairsC = [[0, 39], [1, 38], [4, 10], [5, 9], [14, 20], [15, 19], [26, 32], [27, 31]];
+  const tree = S.buildStructureTree(pairsC, n);
+  // 为碰撞测试单独造一个「梯子」布局：两行等距点，基线无过近对
+  const base = Array.from({ length: n }, (_, i) => ({
+    x: Math.floor(i / 2) * 10,
+    y: (i % 2) * 8,
+  }));
+  const dMin = S.medianSpacing(base) * 0.6;
+  const bSub = S.subtreeResidues(tree, 'stem:4-10');
+  const cSub = S.subtreeResidues(tree, 'stem:14-20');
+  const movedB = new Set(bSub);
+
+  // 基线：正常布局没有「过近对」（骨架相邻与配对均已排除，不会误报）
+  const eff0 = S.effectivePoints(base, tree, {});
+  ok(S.findCollisions(eff0, movedB, pairsC, dMin).length === 0, 'C 基线布局零碰撞');
+
+  // 把 B 分支整体移到 C 分支上 → 必然检出
+  const cen = (idxs, pts) => {
+    let x = 0; let y = 0;
+    for (const i of idxs) { x += pts[i].x; y += pts[i].y; }
+    return { x: x / idxs.length, y: y / idxs.length };
+  };
+  const bC = cen(bSub, base);
+  const cC = cen(cSub, base);
+  // 故意错开 2.7 个单位：完全对齐会让对称推力互相抵消
+  const ov0 = { 'stem:4-10': { angle: 0, dx: cC.x - bC.x + 2.7, dy: cC.y - bC.y } };
+  const eff1 = S.effectivePoints(base, tree, ov0);
+  const hits1 = S.findCollisions(eff1, movedB, pairsC, dMin);
+  ok(hits1.length > 0, 'C 叠放后被检出', `${hits1.length} 对`);
+
+  // 自动避让：收敛、只动本分支、保持刚体、位移有上限
+  const res = S.autoAvoid(tree, base, ov0, 'stem:4-10', { pairs: pairsC });
+  ok(res.shifted && res.before > 0, 'C 避让发生', JSON.stringify({ before: res.before, after: res.after }));
+  ok(res.after === 0, 'C 重叠全部消除', `after=${res.after}`);
+  const eff2 = S.effectivePoints(base, tree, res.overrides);
+  let onlyB = true;
+  for (let i = 0; i < n; i++) {
+    if (!movedB.has(i) && !nearPt(eff2[i], base[i], 1e-9)) onlyB = false;
+  }
+  ok(onlyB, 'C 只移动了该分支（其余逐点不动）');
+  rigidInvariant(base, eff2, bSub, 'C 避让后分支仍为刚体');
+  const o1 = res.overrides['stem:4-10'];
+  const shift = Math.hypot(o1.dx - ov0['stem:4-10'].dx, o1.dy - ov0['stem:4-10'].dy);
+  ok(shift <= S.ptsSpan(base) * 0.25 + 1e-6, 'C 位移在上限内', shift.toFixed(2));
+
+  // 无碰撞时 autoAvoid 不动
+  const res0 = S.autoAvoid(tree, base, {}, 'stem:4-10', { pairs: pairsC });
+  ok(res0.shifted === false && res0.after === 0, 'C 无碰撞时不产生位移');
+}
+
 /* ═══════════ 汇总 ═══════════ */
 console.log('----');
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);

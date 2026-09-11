@@ -1073,7 +1073,7 @@ function setupCanvasInteraction() {
         );
         const ov0 = state.layoutOverrides[u.id] || {};
         rotateDrag = {
-          unit: u, pv,
+          unit: u, pv, prevOv: { ...ov0 },
           startAng: Math.atan2(m.y - pv.y, m.x - pv.x),
           angle0: ov0.angle || 0, deg: ov0.angle || 0, snapped: false, moved: false,
         };
@@ -1136,7 +1136,7 @@ function setupCanvasInteraction() {
             others.push({ x: x / se.residues.length, y: y / se.residues.length });
           }
           arrangeTranslate = {
-            unit: u, moved: false, captured: false,
+            unit: u, moved: false, captured: false, prevOv: { ...ov0 },
             x0: ev.clientX, y0: ev.clientY, scale,
             dx0: ov0.dx || 0, dy0: ov0.dy || 0, angle0: ov0.angle || 0,
             invM: RS.inheritedMatrix(tree, u.id, base, state.layoutOverrides),
@@ -1283,6 +1283,7 @@ function setupCanvasInteraction() {
       el.hoverReadout.classList.remove('is-on');
       try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
       if (r.moved) {
+        avoidAfterMove(r.unit, r.prevOv);
         pushHistory(`旋转 ${r.unit.label}（${fmtDeg(r.angle0)} → ${fmtDeg(r.deg)}）`);
         saveSession();
       }
@@ -1295,6 +1296,7 @@ function setupCanvasInteraction() {
       state.snapGuides = [];
       try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
       if (t.moved) {
+        avoidAfterMove(t.unit, t.prevOv);
         pushHistory(`平移 ${t.unit.label}`);
         saveSession();
       }
@@ -4088,6 +4090,24 @@ function resetLoopShape(u) {
   render();
   saveSession();
   toast(`${loopName(u)}已恢复默认形状`);
+}
+
+/** 旋转/平移结束后：重叠检测 + 对分支做最小位移自动避让（只动该分支） */
+function avoidAfterMove(stemUnit, prevOv) {
+  const base = basePoints();
+  if (!base) return false;
+  const tree = structureTree();
+  const res = RS.autoAvoid(tree, base, state.layoutOverrides, stemUnit.id, {
+    pairs: state.pairs,
+    prev: prevOv || {},
+  });
+  if (!res.shifted && !res.reverted) return false;
+  state.layoutOverrides = res.overrides;
+  render();
+  if (res.reverted) toast('此位置会与其它结构重叠，已放回原处');
+  else if (res.after) toast(`已自动避让（仍有 ${res.after} 处偏近，可手动微调）`);
+  else toast('已自动避让重叠部分');
+  return true;
 }
 
 /** 选中态变化时更新横幅提示 */

@@ -450,6 +450,159 @@
     };
   }
 
+  /* ── 碰撞检测与自动避让 ── */
+
+  /** 坐标集的空间尺度（max(width, height)） */
+  function ptsSpan(pts) {
+    let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return Math.max(maxX - minX, maxY - minY, 1e-6);
+  }
+
+  /** 相邻碱基间距的中位数（图内坐标的“一格”有多大） */
+  function medianSpacing(pts) {
+    const gaps = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      gaps.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
+    }
+    gaps.sort((a, b) => a - b);
+    return gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1;
+  }
+
+  /**
+   * 找「移动组 vs 其余残基」的过近对（d < dMin）。
+   * 排除：骨架相邻残基（|a-b|==1）与已有配对（含假结）。
+   * @returns [{a, b, d}]，其中 a ∈ movedSet
+   */
+  function findCollisions(pts, movedSet, pairs, dMin) {
+    const excluded = new Set();
+    for (const [i, j] of normPairs(pairs || [])) excluded.add(`${i},${j}`);
+    const cell = Math.max(dMin, 1e-9);
+    const grid = new Map();
+    const key = (gx, gy) => `${gx}:${gy}`;
+    for (let b = 0; b < pts.length; b++) {
+      if (movedSet.has(b)) continue;
+      const k = key(Math.floor(pts[b].x / cell), Math.floor(pts[b].y / cell));
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push(b);
+    }
+    const out = [];
+    for (const a of movedSet) {
+      const pa = pts[a];
+      if (!pa) continue;
+      const gx = Math.floor(pa.x / cell);
+      const gy = Math.floor(pa.y / cell);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const bucket = grid.get(key(gx + ox, gy + oy));
+          if (!bucket) continue;
+          for (const b of bucket) {
+            if (Math.abs(a - b) === 1) continue;
+            if (excluded.has(`${Math.min(a, b)},${Math.max(a, b)}`)) continue;
+            const d = Math.hypot(pa.x - pts[b].x, pa.y - pts[b].y);
+            if (d < dMin) out.push({ a, b, d });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 自动避让：只对被移动的 stem 做「最小刚体平移」迭代推开——
+   * 推力 = 碰撞对沿 (moved − static) 方向之和；直到无碰撞、或到迭代/位移上限。
+   * 位移以语义 override（dx/dy）写回，分支保持刚体。
+   * @returns { overrides（新对象）, shifted, before, after }
+   */
+  function autoAvoid(tree, base, overrides, stemId, opts) {
+    const o = opts || {};
+    const maxIter = o.maxIter == null ? 20 : o.maxIter;
+    const capRatio = o.capRatio == null ? 0.25 : o.capRatio;
+    const stem = tree.elements.get(stemId);
+    if (!stem || stem.type !== 'stem') {
+      return { overrides: overrides || {}, shifted: false, before: 0, after: 0 };
+    }
+    const ov = { ...(overrides || {}) };
+    const movedSet = new Set(subtreeResidues(tree, stemId));
+    const span = o.span || ptsSpan(base);
+    const dMin = o.dMin || medianSpacing(base) * 0.6;
+    let pts = effectivePoints(base, tree, ov);
+    let hits = findCollisions(pts, movedSet, o.pairs, dMin);
+    const before = hits.length;
+    if (!before) return { overrides: ov, shifted: false, before, after: 0 };
+
+    const M = inheritedMatrix(tree, stemId, base, ov);
+    const la = M[0]; const lb = M[1]; const lc = M[2]; const ld = M[3];
+    const cur = ov[stemId] || { angle: 0, dx: 0, dy: 0 };
+    let dx = cur.dx || 0;
+    let dy = cur.dy || 0;
+    const cap = span * capRatio;
+    let shiftX = 0; let shiftY = 0;
+    const prev = o.prev;                 // 拖拽前的 override：避不开时兜底回退
+
+    for (let iter = 0; iter < maxIter && hits.length; iter++) {
+      let px = 0; let py = 0;
+      let maxPen = 0;
+      for (const h of hits) {
+        const pa = pts[h.a]; const pb = pts[h.b];
+        let vx = pa.x - pb.x; let vy = pa.y - pb.y;
+        const l = Math.hypot(vx, vy);
+        if (l < 1e-9) { vx = 1; vy = 0; } else { vx /= l; vy /= l; }
+        px += vx; py += vy;
+        maxPen = Math.max(maxPen, dMin - h.d);
+      }
+      // 步长随最深穿透自适应（略过冲，避免长尾收敛慢）
+      const step = Math.min(Math.max(maxPen * 1.1, dMin * 0.3), dMin * 1.5);
+      const pl = Math.hypot(px, py);
+      let wx; let wy;
+      if (pl < 1e-9) {
+        // 推力和相互抵消（被夹在中间）：沿第一对碰撞的垂直方向挪一挪，打破平衡
+        let ux = pts[hits[0].a].x - pts[hits[0].b].x;
+        let uy = pts[hits[0].a].y - pts[hits[0].b].y;
+        const ul = Math.hypot(ux, uy) || 1;
+        ux /= ul; uy /= ul;
+        wx = -uy * step; wy = ux * step;
+      } else {
+        wx = (px / pl) * step; wy = (py / pl) * step;
+      }
+      // 渲染帧位移 → 基点帧（刚体矩阵线性部分可转置求逆）
+      dx += la * wx + lb * wy;
+      dy += lc * wx + ld * wy;
+      shiftX += wx; shiftY += wy;
+      ov[stemId] = { angle: cur.angle || 0, dx, dy };
+      pts = effectivePoints(base, tree, ov);
+      hits = findCollisions(pts, movedSet, o.pairs, dMin);
+      if (Math.hypot(shiftX, shiftY) > cap) break;
+    }
+
+    let reverted = false;
+    if (hits.length && prev !== undefined) {
+      // 兜底：避不开就放回拖拽前的位置（保证不把重叠留在画面上）
+      const pv = prev || {};
+      if (pv.angle || pv.dx || pv.dy) {
+        ov[stemId] = { angle: pv.angle || 0, dx: pv.dx || 0, dy: pv.dy || 0 };
+      } else {
+        delete ov[stemId];
+      }
+      reverted = true;
+      const ptsR = effectivePoints(base, tree, ov);
+      hits = findCollisions(ptsR, movedSet, o.pairs, dMin);
+    }
+
+    return {
+      overrides: ov,
+      shifted: dx !== (cur.dx || 0) || dy !== (cur.dy || 0),
+      reverted,
+      before,
+      after: hits.length,
+    };
+  }
+
   /**
    * 计算有效坐标：基点 → 叠加全部 overrides（stem 刚体变换 + 环形变）。
    * @param {Array<{x:number,y:number}>} base 基点坐标（自动布局或旧 manualPoints）
@@ -497,6 +650,10 @@
     inheritedMatrix,
     loopStretches,
     loopShape,
+    ptsSpan,
+    medianSpacing,
+    findCollisions,
+    autoAvoid,
     mulM,
     applyM,
     rotationAbout,
