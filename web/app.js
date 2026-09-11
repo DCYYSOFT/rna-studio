@@ -43,10 +43,10 @@ const state = {
   lastRenderedPoints: null, // 上一次真正画出来的坐标，用于折叠过渡动画
   lastRenderedPairs: [],
   invalidPairs: new Set(),  // 非经典配对（PDB 导入或改碱基所致），标紫提示但不自动解除
-  manualPoints: null,       // 手动拖动后的坐标；null 表示用后端给的自动布局
-  arrange: false,           // 「调整排版」模式：拖动移动螺旋而不是平移画布
-  pickedBase: null,         // 选中单位里的任一个碱基（索引），用于在结构变化后重新定位
-  pickedUnit: null,         // 派生出来的选中单位 {kind, id, bases}
+  manualPoints: null,       // 旧版手工坐标基线（兼容旧存档）；新版排版编辑只写 layoutOverrides
+  layoutOverrides: {},      // 排版语义状态：{ stemId: {angle, dx, dy} }（基点坐标系，见 structure.js）
+  pickedBase: null,         // 选中元素里的任一个碱基（索引），用于在结构变化后重新定位
+  pickedUnit: null,         // 派生出来的选中元素 {kind:'stem'|'loop', id, bases, subtree?}
   detached: null,           // Set<helixId>：已断开为自由图形的螺旋
   snapGuides: [],           // 拖动时的对齐辅助线
   suppressAnim: false,      // 交互拖动/旋转期间关掉折叠过渡动画，否则动画会和手势打架
@@ -58,6 +58,57 @@ const state = {
 };
 
 const BASE_COLORS = { A: '#4E9143', C: '#2F6FB5', G: '#D2912A', U: '#BE4A47' };
+
+/* ── 结构树（由配对表推导；排版语义状态是 state.layoutOverrides） ── */
+
+const RS = window.RNAStruct;
+
+let treeCache = { key: null, tree: null };
+
+/** 当前结构树（带缓存；配对变化时重建并清理失效的排版 override） */
+function structureTree() {
+  const key = `${state.sequence.length}|${state.pairs.map((p) => `${p[0]}-${p[1]}`).join(',')}`;
+  if (treeCache.key !== key) {
+    treeCache = { key, tree: RS.buildStructureTree(state.pairs, state.sequence.length) };
+    const pr = RS.pruneOverrides(treeCache.tree, state.layoutOverrides);
+    if (pr.dropped.length) state.layoutOverrides = pr.kept;
+  }
+  return treeCache.tree;
+}
+
+/** 基点坐标：旧存档的 manualPoints 优先，否则用后端自动布局 */
+function basePoints() {
+  if (state.manualPoints) return state.manualPoints;
+  const L = state.result && state.result.layout;
+  return L ? L.points : null;
+}
+
+/** 一组坐标的包围盒（排版后给取景 / 吸附 / 导出用） */
+function boundsOf(pts) {
+  let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const span = Math.max(maxX - minX, maxY - minY, 1e-6);
+  return { minX, minY, maxX, maxY, span };
+}
+
+/** 当前应绘制的有效坐标 = 基点 + layoutOverrides */
+function effectivePoints() {
+  const base = basePoints();
+  if (!base) return null;
+  if (!RS.hasAnyOverride(state.layoutOverrides)) return base;
+  return RS.effectivePoints(base, structureTree(), state.layoutOverrides);
+}
+
+/** 把角度规范到 (-180°, 180°] 并格式化 */
+function fmtDeg(deg) {
+  const d = ((deg % 360) + 540) % 360 - 180;
+  return `${d.toFixed(1)}°`;
+}
 
 /* ────────────────────────────── DOM ────────────────────────────── */
 
@@ -759,10 +810,10 @@ function render() {
   el.canvasEmpty.hidden = true;
   renderLegend();
 
-  // 手动拖过排版就用那一份坐标，否则用后端算的
-  const layoutForDraw = state.manualPoints
-    ? { ...state.result.layout, points: state.manualPoints }
-    : state.result.layout;
+  // 基点坐标之上叠加语义排版（layoutOverrides）得到本次要画的坐标
+  const ptsEff = effectivePoints();
+  if (!ptsEff) return;
+  const layoutForDraw = { ...state.result.layout, points: ptsEff, bounds: boundsOf(ptsEff) };
 
   if (state.suppressAnim) state.lastRenderedPoints = null;
   const geo = drawStructure(el.canvas, {
@@ -792,7 +843,7 @@ function render() {
   // 若位置没有实质变化（如只是切换配色）就跳过，免得白跑一遍。
   // 排版模式下叠加选择框与对齐辅助线（画在结构之上）
   if (isArrange() && !isReadOnly()) {
-    if (state.pickedBase != null) state.pickedUnit = pickUnit(state.pickedBase);
+    if (state.pickedBase != null) state.pickedUnit = pickElement(state.pickedBase);
     drawSelectionOverlay(el.canvas, layoutForDraw.points, geo.r);
     drawSnapGuides(el.canvas, geo.r, layoutForDraw.bounds.span);
   }
@@ -926,7 +977,13 @@ function onCanvasContext(ev) {
   if (i == null) return;
   ev.preventDefault();
   if (isReadOnly()) { toast('仅预览模式下画布已锁定，先切换编辑模式'); return; }
-  if (isArrange() || state.editMode === 'sequence') return;   // 只在改配对模式生效
+  if (isArrange()) {
+    // 排版模式：右键 = 重置该 stem 的整个分支布局
+    const u = pickElement(i);
+    if (u && u.kind === 'stem') resetBranch(u);
+    return;
+  }
+  if (state.editMode === 'sequence') return;   // 其余只在改配对模式生效
 
   const partner = pairMap().get(i);
   const before = state.pairs.length;
@@ -952,9 +1009,9 @@ function zoomBy(factor, cx, cy) {
 }
 
 function fitView() {
-  const layout = state.result && state.result.layout;
-  if (!layout || !layout.points.length) return;
-  const b = layout.bounds;
+  const pts = effectivePoints();
+  if (!pts || !pts.length) return;
+  const b = boundsOf(pts);
   const pad = Math.max(24, b.span * 0.06);
   state.view = {
     x: b.minX - pad, y: b.minY - pad,
@@ -986,7 +1043,7 @@ function setupCanvasInteraction() {
   }, { passive: false });
 
   let panning = null;
-  let arrangeDrag = null;
+  let arrangeTranslate = null;
 
   let rotateDrag = null;
 
@@ -995,19 +1052,20 @@ function setupCanvasInteraction() {
     if (isArrange() && !isReadOnly()
         && ev.target && ev.target.dataset && ev.target.dataset.role === 'rotate') {
       const u = state.pickedUnit;
-      const pts = currentPoints();
-      if (u && pts) {
-        if (!state.manualPoints) {
-          state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
-        }
+      const base = basePoints();
+      if (u && u.kind === 'stem' && base) {
+        const tree = structureTree();
         const m = screenToModel(ev.clientX, ev.clientY);
-        const c = unitCenter(u, state.manualPoints);
-        const origPts = {};
-        for (const b of u.bases) origPts[b] = { x: state.manualPoints[b].x, y: state.manualPoints[b].y };
+        // pivot 以「祖先变换之后的当前位置」为准；旋转写语义角度，无需坐标快照
+        const pv = RS.applyM(
+          RS.inheritedMatrix(tree, u.id, base, state.layoutOverrides),
+          RS.stemPivot(tree, u.id, base),
+        );
+        const ov0 = state.layoutOverrides[u.id] || {};
         rotateDrag = {
-          unit: u, center: c, origPts,
-          startAng: Math.atan2(m.y - c.y, m.x - c.x),
-          scale: m.scale, total: 0, snapped: false, moved: false,
+          unit: u, pv,
+          startAng: Math.atan2(m.y - pv.y, m.x - pv.x),
+          angle0: ov0.angle || 0, deg: ov0.angle || 0, snapped: false, moved: false,
         };
         state.suppressAnim = true;
         el.canvasScroll.setPointerCapture(ev.pointerId);
@@ -1016,25 +1074,47 @@ function setupCanvasInteraction() {
       }
     }
 
-    // 调整排版模式：拖碱基 = 移动它所在的螺旋/环
+    // 排版模式：单击选中结构元素（stem = 整个分支）；拖 stem 本体 = 刚体平移
     if (isArrange() && !isReadOnly()) {
-      const unit = baseFromEvent(ev);
-      if (unit != null) {
+      const hit = baseFromEvent(ev);
+      if (hit != null) {
         const rect = el.canvas.getBoundingClientRect();
         const v = state.view;
         const scale = Math.min(rect.width / v.w, rect.height / v.h) || 1;
-        if (!state.manualPoints && state.result && state.result.layout) {
-          state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
-        }
-        // 点中某个碱基 = 选中它所在的单位，然后可以拖着走
-        state.pickedBase = unit;
-        state.pickedUnit = pickUnit(unit);
+        const u = pickElement(hit);
+        const sameSel = !!u && !!state.pickedUnit && u.id === state.pickedUnit.id;
+        state.pickedBase = hit;
+        state.pickedUnit = u;
         state.snapGuides = [];
-        updateArrangeBanner();
-        render();          // 必须重绘，否则单击后选择框不会出现
-        arrangeDrag = { base: unit, x: ev.clientX, y: ev.clientY, scale, moved: false };
-        el.canvasScroll.setPointerCapture(ev.pointerId);
-        ev.preventDefault();
+        // 同一元素重复点击不再重建 SVG——否则双击的第二次点击会落到新节点上，
+        // dblclick 收不到（「双击重置角度」依赖这一点）
+        if (!sameSel) { updateArrangeBanner(); render(); }
+        if (u && u.kind === 'stem' && basePoints()) {
+          const base = basePoints();
+          const tree = structureTree();
+          const ov0 = state.layoutOverrides[u.id] || {};
+          // 以「其它 stem 的当前中心」为对齐参考；拖动期间它们不动，先缓存
+          const pts = effectivePoints() || base;
+          const subIds = new Set(RS.subtreeIds(tree, u.id));
+          const others = [];
+          for (const sid of tree.stems) {
+            if (subIds.has(sid)) continue;
+            const se = tree.elements.get(sid);
+            let x = 0; let y = 0;
+            for (const b of se.residues) { x += pts[b].x; y += pts[b].y; }
+            others.push({ x: x / se.residues.length, y: y / se.residues.length });
+          }
+          arrangeTranslate = {
+            unit: u, moved: false, captured: false,
+            x0: ev.clientX, y0: ev.clientY, scale,
+            dx0: ov0.dx || 0, dy0: ov0.dy || 0, angle0: ov0.angle || 0,
+            invM: RS.inheritedMatrix(tree, u.id, base, state.layoutOverrides),
+            others,
+          };
+        }
+        // 这里不 setPointerCapture、也不 preventDefault：指针捕获会把
+        // click / dblclick / contextmenu 重定向到容器上（双击重置角度、
+        // 右键重置分支都依赖它们）。等真正开始拖动（第一次 pointermove）再捕获。
         return;
       }
     }
@@ -1053,50 +1133,74 @@ function setupCanvasInteraction() {
   });
   el.canvasScroll.addEventListener('pointermove', (ev) => {
     if (rotateDrag) {
-      const pts = state.manualPoints;
       const m = screenToModel(ev.clientX, ev.clientY);
-      let total = Math.atan2(m.y - rotateDrag.center.y, m.x - rotateDrag.center.x)
-        - rotateDrag.startAng;
-      // 每 15° 吸附，抖动小于约 4° 时吸住
-      const SNAP = Math.PI / 12;
-      const nearest = Math.round(total / SNAP) * SNAP;
-      rotateDrag.snapped = Math.abs(total - nearest) < 0.07;
-      if (rotateDrag.snapped) total = nearest;
-      rotateDrag.total = total;
+      const raw = Math.atan2(m.y - rotateDrag.pv.y, m.x - rotateDrag.pv.x) - rotateDrag.startAng;
+      let deg = rotateDrag.angle0 + (raw * 180) / Math.PI;
+      // Shift = 吸附到 15° 整数倍；默认自由角度
+      rotateDrag.snapped = false;
+      if (ev.shiftKey) {
+        deg = Math.round(deg / 15) * 15;
+        rotateDrag.snapped = true;
+      }
+      rotateDrag.deg = deg;
       rotateDrag.moved = true;
-
-      rotateBases(rotateDrag.unit.bases, rotateDrag.center, total, rotateDrag.origPts, pts);
-      relaxAfterUnit(rotateDrag.unit, pts);
-      refreshManualBounds();
+      const id = rotateDrag.unit.id;
+      const prev = state.layoutOverrides[id] || {};
+      state.layoutOverrides[id] = { angle: deg, dx: prev.dx || 0, dy: prev.dy || 0 };
       state.fitPending = false;
       render();
 
-      const deg = (total * 180 / Math.PI).toFixed(1);
-      el.hoverReadout.textContent = `旋转 ${deg}°` + (rotateDrag.snapped ? '　已吸附到 15° 的整数倍' : '');
+      el.hoverReadout.textContent =
+        `${rotateDrag.unit.label} · ${fmtDeg(deg)}` + (rotateDrag.snapped ? '　已吸附 15°' : '');
       el.hoverReadout.classList.add('is-on');
       return;
     }
-    if (arrangeDrag) {
-      let dx = (ev.clientX - arrangeDrag.x) / arrangeDrag.scale;
-      let dy = (ev.clientY - arrangeDrag.y) / arrangeDrag.scale;
-      if (dx || dy) {
-        // 与其他单位对齐则吸附，并留下辅助线
-        const pts0 = currentPoints();
-        const span = (state.result && state.result.layout)
-          ? state.result.layout.bounds.span : 100;
-        if (state.pickedUnit && pts0) {
-          const snap = applySnap(state.pickedUnit, pts0, dx, dy, span);
-          dx = snap.dx; dy = snap.dy; state.snapGuides = snap.guides;
-        }
-        moveUnit(arrangeDrag.base, dx, dy);
-        arrangeDrag.x = ev.clientX;
-        arrangeDrag.y = ev.clientY;
-        arrangeDrag.moved = true;
-        state.suppressAnim = true;
-        refreshManualBounds();
-        state.fitPending = false;
-        render();
+    if (arrangeTranslate) {
+      const t = arrangeTranslate;
+      const sdx = (ev.clientX - t.x0) / t.scale;
+      const sdy = (ev.clientY - t.y0) / t.scale;
+      if (!sdx && !sdy) return;
+      if (!t.captured) {
+        try { el.canvasScroll.setPointerCapture(ev.pointerId); t.captured = true; } catch { /* noop */ }
       }
+      // 屏幕帧位移 → 基点坐标系（刚体矩阵的线性部分可转置求逆）
+      const [a, b, c, d] = t.invM;
+      let dx = t.dx0 + (a * sdx + b * sdy);
+      let dy = t.dy0 + (c * sdx + d * sdy);
+
+      // 对齐吸附：与其它 stem 的当前中心比较（两侧都用 stem 自身残基的中心）
+      const base = basePoints();
+      const tree = structureTree();
+      const span = (state.result && state.result.layout) ? state.result.layout.bounds.span : 100;
+      const thr = span * 0.015;
+      const candOv = { ...state.layoutOverrides, [t.unit.id]: { angle: t.angle0, dx, dy } };
+      const candPts = RS.effectivePoints(base, tree, candOv);
+      let cx = 0; let cy = 0;
+      for (const bidx of t.unit.bases) { cx += candPts[bidx].x; cy += candPts[bidx].y; }
+      cx /= t.unit.bases.size; cy /= t.unit.bases.size;
+      let bestX = thr; let gx = null;
+      let bestY = thr; let gy = null;
+      for (const o of t.others) {
+        const ddx = Math.abs(cx - o.x);
+        if (ddx < bestX) { bestX = ddx; gx = o.x; }
+        const ddy = Math.abs(cy - o.y);
+        if (ddy < bestY) { bestY = ddy; gy = o.y; }
+      }
+      const guides = [];
+      if (gx != null || gy != null) {
+        const corrX = gx != null ? gx - cx : 0;
+        const corrY = gy != null ? gy - cy : 0;
+        dx += a * corrX + b * corrY;
+        dy += c * corrX + d * corrY;
+        if (gx != null) guides.push({ axis: 'x', at: gx, from: -1e5, to: 1e5 });
+        if (gy != null) guides.push({ axis: 'y', at: gy, from: -1e5, to: 1e5 });
+      }
+      state.snapGuides = guides;
+      state.layoutOverrides[t.unit.id] = { angle: t.angle0, dx, dy };
+      t.moved = true;
+      state.suppressAnim = true;
+      state.fitPending = false;
+      render();
       return;
     }
     if (!panning) return;
@@ -1106,24 +1210,26 @@ function setupCanvasInteraction() {
   });
   const endPan = (ev) => {
     if (rotateDrag) {
-      const moved = rotateDrag.moved;
+      const r = rotateDrag;
       rotateDrag = null;
       state.suppressAnim = false;
       el.hoverReadout.classList.remove('is-on');
       try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
-      if (moved) { pushHistory('旋转螺旋'); saveSession(); }
+      if (r.moved) {
+        pushHistory(`旋转 ${r.unit.label}（${fmtDeg(r.angle0)} → ${fmtDeg(r.deg)}）`);
+        saveSession();
+      }
       return;
     }
-    if (arrangeDrag) {
-      const moved = arrangeDrag.moved;
-      arrangeDrag = null;
+    if (arrangeTranslate) {
+      const t = arrangeTranslate;
+      arrangeTranslate = null;
       state.suppressAnim = false;
       state.snapGuides = [];
       try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
-      if (moved) {
-        pushHistory('调整排版');
+      if (t.moved) {
+        pushHistory(`平移 ${t.unit.label}`);
         saveSession();
-        toast('排版已调整；点「恢复自动布局」可还原');
       }
       return;
     }
@@ -1548,6 +1654,8 @@ function buildExportSvg(scope) {
   clone.querySelectorAll('.is-sel, .is-selected, .is-partnered').forEach((n) => {
     n.classList.remove('is-sel', 'is-selected', 'is-partnered');
   });
+  // 排版选择层（选择框 / pivot / 旋转手柄 / 对齐辅助线）不进插图
+  clone.querySelectorAll('.sel-layer, .snap-layer').forEach((n) => n.remove());
   // 画布上配对线是半透明的（方便看交叉的弦），插图里用实色更清晰
   clone.querySelectorAll('.bp-line').forEach((n) => n.removeAttribute('opacity'));
 
@@ -1783,8 +1891,16 @@ function bindEvents() {
     el.btnStripToggle.textContent = collapsed ? '展开' : '收起';
   });
 
-  // 结构图上双击碱基也能改
+  // 结构图上双击：排版模式 = 重置 stem 角度；改序列模式 = 打开碱基弹窗
   el.canvas.addEventListener('dblclick', (ev) => {
+    if (isArrange() && !isReadOnly()) {
+      const hit = baseFromEvent(ev);
+      if (hit != null) {
+        const u = pickElement(hit);
+        if (u && u.kind === 'stem') { resetStemAngle(u); ev.preventDefault(); }
+      }
+      return;
+    }
     const i = baseFromEvent(ev);
     if (i == null || isReadOnly()) return;
     if (state.editMode !== 'sequence') return;   // 只在改序列模式生效
@@ -1996,6 +2112,8 @@ function snapshot(label) {
   return {
     pairs: state.pairs.map((p) => [p[0], p[1]]),
     forbidden: new Set(state.forbidden),
+    // 排版语义状态随结构一起入栈，undo/redo 才能真实还原布局
+    layoutOverrides: JSON.parse(JSON.stringify(state.layoutOverrides || {})),
     label,
   };
 }
@@ -2017,6 +2135,7 @@ function applyHistory(idx) {
   const h = state.history[idx];
   state.pairs = h.pairs.map((p) => [p[0], p[1]]);
   state.forbidden = new Set(h.forbidden);
+  state.layoutOverrides = JSON.parse(JSON.stringify(h.layoutOverrides || {}));
   state.selection = null;
   render();
   renderHistory();
@@ -2459,9 +2578,10 @@ function reverseComplement(s) {
 
 /** 把视角挪到某个碱基上（保持当前缩放倍数）。 */
 function centerOn(idx) {
-  const layout = state.result && state.result.layout;
-  if (!layout || !layout.points || !layout.points[idx]) return;
-  const p = layout.points[idx];
+  const pts = effectivePoints()
+    || (state.result && state.result.layout && state.result.layout.points);
+  if (!pts || !pts[idx]) return;
+  const p = pts[idx];
   const v = state.view;
   state.view = { x: p.x - v.w / 2, y: p.y - v.h / 2, w: v.w, h: v.h };
   applyViewBox();
@@ -2880,6 +3000,7 @@ function collectSession() {
     forbidden: [...state.forbidden],
     domains: state.domains.map((d) => ({ ...d })),
     manualPoints: state.manualPoints ? state.manualPoints.map((p) => ({ x: p.x, y: p.y })) : null,
+    layoutOverrides: JSON.parse(JSON.stringify(state.layoutOverrides || {})),
   };
 }
 
@@ -2938,6 +3059,9 @@ function restoreSession() {
   state.domains = Array.isArray(d.domains) ? d.domains : [];
   state.manualPoints = Array.isArray(d.manualPoints) && d.manualPoints.length === d.sequence.length
     ? d.manualPoints.map((p) => ({ x: p.x, y: p.y })) : null;
+  state.layoutOverrides = (d.layoutOverrides && typeof d.layoutOverrides === 'object'
+    && !Array.isArray(d.layoutOverrides))
+    ? JSON.parse(JSON.stringify(d.layoutOverrides)) : {};
   state.colorMode = el.colorMode.value;
 
   el.constraints.value = d.constraints && d.constraints.length === d.sequence.length
@@ -3357,133 +3481,7 @@ function toRanges(sorted) {
   return out.slice(0, 4).join('、') + (out.length > 4 ? ` 等 ${out.length} 段` : '');
 }
 
-/* ═══════════════════ 拖动螺旋 / 环调整排版 ═══════════════════ */
-
-/** 把配对按「连续堆叠」切成螺旋段 */
-function computeHelices(pairs) {
-  const sorted = [...pairs].map(([i, j]) => (i < j ? [i, j] : [j, i]))
-    .sort((a, b) => a[0] - b[0]);
-  const runs = [];
-  let run = null;
-  for (const [i, j] of sorted) {
-    const prev = run && run[run.length - 1];
-    if (prev && i === prev[0] + 1 && j === prev[1] - 1) run.push([i, j]);
-    else { run = [[i, j]]; runs.push(run); }
-  }
-  const baseToHelix = new Map();
-  runs.forEach((r, idx) => { for (const [i, j] of r) { baseToHelix.set(i, idx); baseToHelix.set(j, idx); } });
-  return { runs, baseToHelix };
-}
-
-/** 把未配对的连续片段切成环；anchor5/anchor3 是两侧的锚点碱基 */
-function computeLoops(n, pairs) {
-  const paired = new Array(n).fill(false);
-  for (const [i, j] of pairs) { paired[i] = true; paired[j] = true; }
-  const loops = [];
-  let s = null;
-  for (let i = 0; i <= n; i++) {
-    const unpaired = i < n && !paired[i];
-    if (unpaired) { if (s === null) s = i; }
-    else if (s !== null) { loops.push({ start: s, end: i - 1, bases: [] }); s = null; }
-  }
-  for (const L of loops) {
-    for (let b = L.start; b <= L.end; b++) L.bases.push(b);
-    L.anchor5 = (L.start - 1 >= 0 && paired[L.start - 1]) ? L.start - 1 : null;
-    L.anchor3 = (L.end + 1 < n && paired[L.end + 1]) ? L.end + 1 : null;
-  }
-  return loops;
-}
-
-/**
- * 把环上的碱基重新铺在两个锚点之间，向外鼓成一段圆弧。
- *
- * 用二次贝塞尔而不是真圆弧：端点、切线都对，公式简单，也不会出现
- * 圆心角接近 180° 时的数值退化。移动螺旋后靠它把环「抻」开。
- */
-function relayoutLoop(L, pts, centroid, spacing) {
-  const m = L.bases.length;
-  if (!m || L.anchor5 == null || L.anchor3 == null) return;
-  const pa = pts[L.anchor5], pb = pts[L.anchor3];
-  const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
-  let dx = pb.x - pa.x, dy = pb.y - pa.y;
-  const chord = Math.hypot(dx, dy) || 1e-6;
-  let nx = -dy / chord, ny = dx / chord;
-  // 朝背离结构中心的一侧鼓出去，这样环不会叠到螺旋上
-  if ((mx - centroid.x) * nx + (my - centroid.y) * ny < 0) { nx = -nx; ny = -ny; }
-
-  // 鼓出幅度只由「环里有几个碱基」决定，跟两端被拉开多远无关。
-  // 早先版本带了一项 chord*0.3，结果把螺旋拖远时，只有一两个碱基的
-  // 连接环会被推出去老远、拉出一条长线——看着像画坏了。
-  // 上限 chord*1.2 只是防止环特别大时鼓成一个圈。
-  const bulge = Math.min(m * spacing * 0.45, chord * 1.2);
-  const cx = mx + nx * 2 * bulge, cy = my + ny * 2 * bulge;
-
-  for (let k = 0; k < m; k++) {
-    const t = (k + 1) / (m + 1);
-    const u = 1 - t;
-    pts[L.bases[k]].x = u * u * pa.x + 2 * u * t * cx + t * t * pb.x;
-    pts[L.bases[k]].y = u * u * pa.y + 2 * u * t * cy + t * t * pb.y;
-  }
-}
-
-/** 把某个碱基所在的「单位」（螺旋或环）平移 (dx, dy) */
-/** 相邻碱基间距的中位数——不同布局的坐标尺度差很多，用它来定环的鼓出幅度 */
-function typicalSpacing(pts, n) {
-  const gaps = [];
-  for (let i = 0; i < n - 1; i++) {
-    gaps.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
-  }
-  gaps.sort((a, b) => a - b);
-  return gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1;
-}
-
-function moveUnit(baseIdx, dx, dy) {
-  const pts = state.manualPoints;
-  const n = state.sequence.length;
-  const spacing = typicalSpacing(pts, n);
-  const { baseToHelix } = computeHelices(state.pairs);
-  const hid = baseToHelix.get(baseIdx);
-
-  if (hid != null) {
-    const moving = new Set();
-    for (const [i, j] of state.pairs) {
-      if (baseToHelix.get(i) === hid) { moving.add(i); moving.add(j); }
-    }
-    for (const b of moving) { pts[b].x += dx; pts[b].y += dy; }
-    // 与这段螺旋相连的环要跟着变形
-    let cx = 0, cy = 0;
-    for (const p of pts) { cx += p.x; cy += p.y; }
-    const centroid = { x: cx / n, y: cy / n };
-    for (const L of computeLoops(n, state.pairs)) {
-      if ((L.anchor5 != null && moving.has(L.anchor5))
-          || (L.anchor3 != null && moving.has(L.anchor3))) {
-        relayoutLoop(L, pts, centroid, spacing);
-      }
-    }
-  } else {
-    // 未配对：整个环一起平移
-    const L = computeLoops(n, state.pairs).find((l) => l.bases.includes(baseIdx));
-    if (L) for (const b of L.bases) { pts[b].x += dx; pts[b].y += dy; }
-  }
-}
-
-function refreshManualBounds() {
-  const pts = state.manualPoints;
-  if (!pts || !pts.length) return;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of pts) {
-    if (p.x < minX) minX = p.x;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.y > maxY) maxY = p.y;
-  }
-  const span = Math.max(maxX - minX, maxY - minY, 1e-6);
-  state.result.layout = {
-    ...state.result.layout,
-    points: state.manualPoints,
-    bounds: { minX, minY, maxX, maxY, span },
-  };
-}
+/* ═══════════ 排版：结构树语义编辑（建树与变换见 web/structure.js） ═══════════ */
 
 
 /** 切换编辑模式：画布上的一切交互都由它决定 */
@@ -3502,9 +3500,6 @@ function setEditMode(mode) {
 
   if (mode !== 'arrange') {
     state.pickedBase = null; state.pickedUnit = null; state.snapGuides = [];
-  } else if (!state.manualPoints && state.result && state.result.layout) {
-    // 进入排版模式时先固化当前坐标，之后拖的是这一份
-    state.manualPoints = state.result.layout.points.map((q) => ({ ...q }));
   }
   updateArrangeBanner();
   render();
@@ -3513,14 +3508,19 @@ function setEditMode(mode) {
     preview: '仅预览：画布已锁定，切换模式才能编辑',
     pair: '改配对：点两个碱基建立配对，右键解除',
     sequence: '改序列：双击碱基替换字母',
-    arrange: '排版：单击选中螺旋或环，拖动平移、拖圆点旋转',
+    arrange: '排版：单击 stem 选中整个分支；拖本体平移、拖圆点旋转（Shift 15° 吸附）',
   }[mode];
   if (hint) toast(hint);
 }
 
 function restoreAutoLayout() {
-  if (!state.manualPoints) { toast('当前就是自动布局'); return; }
+  const hasOverride = RS.hasAnyOverride(state.layoutOverrides);
+  if (!state.manualPoints && !hasOverride) { toast('当前就是自动布局'); return; }
   state.manualPoints = null;
+  state.layoutOverrides = {};
+  state.pickedBase = null;
+  state.pickedUnit = null;
+  state.snapGuides = [];
   state.fitPending = true;
   void rerender();
   pushHistory('恢复自动布局');
@@ -3759,36 +3759,28 @@ function screenToModel(clientX, clientY) {
 const isReadOnly = () => state.editMode === 'preview';
 const isArrange = () => state.editMode === 'arrange';
 
-function currentPoints() {
-  if (state.manualPoints) return state.manualPoints;
-  const L = state.result && state.result.layout;
-  return L ? L.points : null;
-}
-
-/** 取某个碱基所属的「单位」：螺旋或环 */
-function pickUnit(baseIdx) {
-  const { baseToHelix, runs } = computeHelices(state.pairs);
-  const hid = baseToHelix.get(baseIdx);
-  if (hid != null) {
-    const bases = new Set();
-    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
-    return { kind: 'helix', id: hid, bases, run: runs[hid] };
+/** 取某个碱基所属的结构元素；stem 返回整个分支（含下游子树） */
+function pickElement(baseIdx) {
+  const tree = structureTree();
+  const id = tree.residueToElement[baseIdx];
+  if (id == null) return null;
+  const el = tree.elements.get(id);
+  if (!el) return null;
+  if (el.type === 'stem') {
+    return {
+      kind: 'stem', id: el.id, label: el.label, element: el,
+      bases: new Set(el.residues),
+      subtree: new Set(RS.subtreeResidues(tree, el.id)),
+    };
   }
-  const L = computeLoops(state.sequence.length, state.pairs)
-    .find((l) => l.bases.includes(baseIdx));
-  if (!L) return null;
-  return { kind: 'loop', id: `loop-${L.start}`, bases: new Set(L.bases), loop: L };
+  return { kind: 'loop', id: el.id, label: el.type, element: el, bases: new Set(el.residues) };
 }
 
-function unitCenter(u, pts) {
-  let x = 0; let y = 0;
-  for (const b of u.bases) { x += pts[b].x; y += pts[b].y; }
-  return { x: x / u.bases.size, y: y / u.bases.size };
-}
-
-function unitBounds(u, pts) {
+/** 一组碱基（Set）的包围盒 */
+function setBounds(bases, pts) {
   let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
-  for (const b of u.bases) {
+  for (const b of bases) {
+    if (!pts[b]) continue;
     minX = Math.min(minX, pts[b].x); maxX = Math.max(maxX, pts[b].x);
     minY = Math.min(minY, pts[b].y); maxY = Math.max(maxY, pts[b].y);
   }
@@ -3801,21 +3793,21 @@ function detachedSet() {
   return state.detached;
 }
 
-/** 断开产生的骨架断点：螺旋的碱基与非螺旋碱基相邻的每一处 */
+/** 断开产生的骨架断点：被断开元素与相邻残基相接的每一处 */
 function detachedBreaks() {
   const out = [];
   const det = detachedSet();
   if (!det.size) return out;
-  const { baseToHelix, runs } = computeHelices(state.pairs);
+  const tree = structureTree();
   const n = state.sequence.length;
-  for (const hid of det) {
-    if (!runs[hid]) continue;
-    const bases = new Set();
-    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
-    for (let b = 0; b < n - 1; b++) {
-      const a = bases.has(b); const c = bases.has(b + 1);
-      if (a !== c) out.push(b);            // 一端在螺旋内、一端在外 → 断开
-    }
+  const inSet = new Array(n).fill(false);
+  for (const sid of det) {
+    const e = tree.elements.get(sid);
+    if (!e) continue;
+    for (const b of e.residues) inSet[b] = true;
+  }
+  for (let b = 0; b < n - 1; b++) {
+    if (inSet[b] !== inSet[b + 1]) out.push(b);   // 一端在断开段内、一端在外
   }
   return out;
 }
@@ -3834,7 +3826,23 @@ function drawSelectionOverlay(svg, pts, r) {
   if (!u || !pts) { state.selBox = null; return; }
   const g = mk('g', { class: 'sel-layer' });
 
-  for (const b of u.bases) {
+  const stemSet = u.bases;
+  const subSet = u.subtree || u.bases;
+
+  // 下游子树（不含 stem 本体）：淡色环，示意「会跟着一起转」
+  if (u.kind === 'stem') {
+    for (const b of subSet) {
+      if (stemSet.has(b) || !pts[b]) continue;
+      g.appendChild(mk('circle', {
+        class: 'sel-ring-sub', cx: pts[b].x, cy: pts[b].y, r: r * 1.32,
+        fill: 'none', stroke: '#7B9BD1', 'stroke-width': r * 0.11,
+        'stroke-dasharray': `${r * 0.35} ${r * 0.5}`, opacity: '0.8',
+      }));
+    }
+  }
+
+  // 选中的元素本体：强环
+  for (const b of stemSet) {
     if (!pts[b]) continue;
     g.appendChild(mk('circle', {
       class: 'sel-ring', cx: pts[b].x, cy: pts[b].y, r: r * 1.5,
@@ -3843,7 +3851,8 @@ function drawSelectionOverlay(svg, pts, r) {
     }));
   }
 
-  const bb = unitBounds(u, pts);
+  // 选择框：覆盖整棵子树的范围
+  const bb = setBounds(subSet, pts);
   const pad = r * 2.0;
   const bx = bb.minX - pad; const by = bb.minY - pad;
   const bw = (bb.maxX - bb.minX) + pad * 2; const bh = (bb.maxY - bb.minY) + pad * 2;
@@ -3853,8 +3862,52 @@ function drawSelectionOverlay(svg, pts, r) {
     'stroke-dasharray': `${r * 0.9} ${r * 0.55}`,
   }));
 
-  // 旋转手柄：从选择框上边中间伸出一根小杆 + 一个圆点
-  const hx = bx + bw / 2; const hy = by - r * 3.4;
+  // 旋转手柄：默认在框上方；若位置落到当前视口之外（结构贴边或压在顶部条带下），
+  // 会被裁剪到点不到——收进视口内，保证可交互。
+  let hx = bx + bw / 2;
+  let hy = by - r * 3.4;
+  const v = state.view;
+  const m = r * 2.5;
+  if (hy < v.y + m) hy = v.y + m;
+  if (hx < v.x + m) hx = v.x + m;
+  if (hx > v.x + v.w - m) hx = v.x + v.w - m;
+
+  // pivot（旋转中心 = 与 parent loop 的连接点）+ 旋转轨迹
+  if (u.kind === 'stem') {
+    const tree = structureTree();
+    const base = basePoints();
+    const pv = RS.applyM(
+      RS.inheritedMatrix(tree, u.id, base, state.layoutOverrides),
+      RS.stemPivot(tree, u.id, base),
+    );
+    const rad = Math.hypot(hx - pv.x, hy - pv.y);
+    g.appendChild(mk('circle', {
+      class: 'rot-arc', cx: pv.x, cy: pv.y, r: rad,
+      fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.10,
+      'stroke-dasharray': `${r * 0.28} ${r * 0.55}`, opacity: '0.45',
+      'pointer-events': 'none',
+    }));
+    g.appendChild(mk('line', {
+      class: 'rot-axis', x1: pv.x, y1: pv.y, x2: hx, y2: hy,
+      stroke: '#2F6FB5', 'stroke-width': r * 0.10,
+      'stroke-dasharray': `${r * 0.35} ${r * 0.4}`, opacity: '0.6',
+      'pointer-events': 'none',
+    }));
+    g.appendChild(mk('circle', {
+      class: 'pivot-dot', cx: pv.x, cy: pv.y, r: r * 0.55,
+      fill: '#D2912A', stroke: '#ffffff', 'stroke-width': r * 0.16,
+      'pointer-events': 'none',
+    }));
+    g.appendChild(mk('line', {
+      class: 'pivot-cross', x1: pv.x - r * 0.95, y1: pv.y, x2: pv.x + r * 0.95, y2: pv.y,
+      stroke: '#D2912A', 'stroke-width': r * 0.12, 'pointer-events': 'none',
+    }));
+    g.appendChild(mk('line', {
+      class: 'pivot-cross', x1: pv.x, y1: pv.y - r * 0.95, x2: pv.x, y2: pv.y + r * 0.95,
+      stroke: '#D2912A', 'stroke-width': r * 0.12, 'pointer-events': 'none',
+    }));
+  }
+
   g.appendChild(mk('line', {
     class: 'sel-stem', x1: hx, y1: by, x2: hx, y2: hy,
     stroke: '#2F6FB5', 'stroke-width': r * 0.15,
@@ -3895,77 +3948,34 @@ function drawSnapGuides(svg, r, span) {
   void span;
 }
 
-/* ── 旋转 ── */
+/* ── 重置：单 stem 角度 / 整个分支 ── */
 
-/**
- * 绕质心旋转一组碱基。
- * 从**起始快照**整体应用累计角度，而不是逐帧累加增量——否则每帧的浮点误差
- * 会累积，转一圈回来位置就对不上了。
- */
-function rotateBases(bases, center, theta, origPts, pts) {
-  const cos = Math.cos(theta); const sin = Math.sin(theta);
-  for (const b of bases) {
-    const o = origPts[b];
-    if (!o) continue;
-    const dx = o.x - center.x; const dy = o.y - center.y;
-    pts[b].x = center.x + dx * cos - dy * sin;
-    pts[b].y = center.y + dx * sin + dy * cos;
-  }
+/** 双击：把该 stem 的角度恢复为原始朝向（平移保留） */
+function resetStemAngle(u) {
+  const ov = state.layoutOverrides[u.id];
+  if (!ov || !ov.angle) { toast(`${u.label} 当前就是原始角度`); return; }
+  const before = ov.angle;
+  if (ov.dx || ov.dy) state.layoutOverrides[u.id] = { angle: 0, dx: ov.dx, dy: ov.dy };
+  else delete state.layoutOverrides[u.id];
+  pushHistory(`重置 ${u.label} 角度（${fmtDeg(before)}→0°）`);
+  render();
+  saveSession();
+  toast(`${u.label} 已恢复原始角度`);
 }
 
-/** 旋转后把相连的环重新铺开（已断开的螺旋跳过，那正是「自由摆放」的含义） */
-function relaxAfterUnit(unit, pts) {
-  if (unit.kind === 'helix' && detachedSet().has(unit.id)) return;
-  const n = state.sequence.length;
-  let cx = 0; let cy = 0;
-  for (const p of pts) { cx += p.x; cy += p.y; }
-  const centroid = { x: cx / n, y: cy / n };
-  const spacing = typicalSpacing(pts, n);
-  for (const L of computeLoops(n, state.pairs)) {
-    if ((L.anchor5 != null && unit.bases.has(L.anchor5))
-        || (L.anchor3 != null && unit.bases.has(L.anchor3))) {
-      relayoutLoop(L, pts, centroid, spacing);
-    }
+/** 右键：把整个分支（子树内全部 stem）的排版恢复为自动布局 */
+function resetBranch(u) {
+  const tree = structureTree();
+  const ids = RS.subtreeIds(tree, u.id);
+  let cleared = 0;
+  for (const id of ids) {
+    if (state.layoutOverrides[id]) { delete state.layoutOverrides[id]; cleared += 1; }
   }
-}
-
-/** 拖动时与其他单位对齐则吸附，并返回辅助线 */
-function applySnap(u, pts, dx, dy, span) {
-  const guides = [];
-  const thr = span * 0.015;
-  const c = unitCenter(u, pts);
-  const target = { x: c.x + dx, y: c.y + dy };
-
-  const others = [];
-  const { runs, baseToHelix } = computeHelices(state.pairs);
-  const seen = new Set();
-  for (let b = 0; b < state.sequence.length; b++) {
-    const hid = baseToHelix.get(b);
-    if (hid == null || seen.has(hid)) continue;
-    seen.add(hid);
-    const bases = new Set();
-    for (const [i, j] of runs[hid]) { bases.add(i); bases.add(j); }
-    if (bases.size === u.bases.size && [...bases].every((x) => u.bases.has(x))) continue;
-    others.push(unitCenter({ bases }, pts));
-  }
-
-  let bx = null; let by = null; let bestX = thr; let bestY = thr;
-  for (const o of others) {
-    const ddx = Math.abs(target.x - o.x);
-    if (ddx < bestX) { bestX = ddx; bx = o.x; }
-    const ddy = Math.abs(target.y - o.y);
-    if (ddy < bestY) { bestY = ddy; by = o.y; }
-  }
-  let adx = dx; let ady = dy;
-  if (bx != null) {
-    adx += bx - target.x;
-    guides.push({ axis: 'x', at: bx, from: -1e5, to: 1e5 });
-  }
-  if (by != null) {
-    ady += by - target.y;
-    guides.push({ axis: 'y', at: by, from: -1e5, to: 1e5 });
-  }
-  return { dx: adx, dy: ady, guides };
+  if (!cleared) { toast(`${u.label} 分支当前就是自动布局`); return; }
+  pushHistory(`重置 ${u.label} 分支布局`);
+  render();
+  saveSession();
+  toast(`已重置 ${u.label} 分支（${cleared} 处调整）`);
 }
 
 /** 选中态变化时更新横幅提示 */
@@ -3974,20 +3984,27 @@ function updateArrangeBanner() {
   const box = el.arrangeSel;
   if (!box) return;
   if (!u) {
-    box.innerHTML = '<span class="arrange-dim">单击一个螺旋或环即可选中它</span>';
+    box.innerHTML = '<span class="arrange-dim">单击一个 stem 选中整个分支；单击环只做高亮</span>';
     return;
   }
-  const n = u.bases.size;
-  const isDet = u.kind === 'helix' && detachedSet().has(u.id);
-  box.innerHTML =
-    `<b>已选中</b> ${u.kind === 'helix' ? '螺旋' : '环'}（${n} 个碱基）`
-    + `<span class="arrange-sep">·</span>拖动本体可平移`
-    + `<span class="arrange-sep">·</span>拖上方圆点可旋转`
-    + (u.kind === 'helix'
-      ? `<span class="arrange-sep">·</span><button class="link-btn" id="btn-detach" type="button">`
-        + (isDet ? '重新连接' : '断开为自由图形') + '</button>'
-      : '')
-    + `<span class="arrange-sep">·</span><button class="link-btn" id="btn-unpick" type="button">取消选中</button>`;
+  const sep = '<span class="arrange-sep">·</span>';
+  if (u.kind === 'stem') {
+    const isDet = detachedSet().has(u.id);
+    box.innerHTML =
+      `<b>已选中 ${u.label}</b>（${u.element.pairs.length} 对 · 子树 ${u.subtree.size} 个残基）`
+      + sep + '拖本体平移'
+      + sep + '拖圆点绕连接点旋转（Shift 吸附 15°）'
+      + sep + '双击重置角度'
+      + sep + '右键重置分支'
+      + sep + '<button class="link-btn" id="btn-detach" type="button">'
+      + (isDet ? '重新连接' : '断开为自由图形') + '</button>'
+      + sep + '<button class="link-btn" id="btn-unpick" type="button">取消选中</button>';
+  } else {
+    box.innerHTML =
+      `<b>已选中 环</b>（${u.bases.size} 个残基）`
+      + sep + '环的形变编辑在后续阶段提供'
+      + sep + '<button class="link-btn" id="btn-unpick" type="button">取消选中</button>';
+  }
 
   const det = document.getElementById('btn-detach');
   if (det) det.onclick = toggleDetach;
@@ -3998,7 +4015,7 @@ function updateArrangeBanner() {
 /** 断开 / 重新连接选中螺旋 */
 function toggleDetach() {
   const u = state.pickedUnit;
-  if (!u || u.kind !== 'helix') return;
+  if (!u || u.kind !== 'stem') return;
   const det = detachedSet();
   if (det.has(u.id)) {
     det.delete(u.id);

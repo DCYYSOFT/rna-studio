@@ -311,6 +311,32 @@
     return { kept, dropped };
   }
 
+  /** 单层 stem 的局部运动（先绕 pivot 旋转、再平移），叠加到继承矩阵 M 上 */
+  function localMatrixOf(tree, stem, M, base, overrides) {
+    const o = overrides && overrides[stem.id];
+    if (!o || (!o.angle && !o.dx && !o.dy)) return M;
+    let L = IDENT;
+    if (o.angle) L = mulM(rotationAbout(o.angle, stemPivot(tree, stem.id, base)), L);
+    if (o.dx || o.dy) L = mulM(translationM(o.dx || 0, o.dy || 0), L);
+    return mulM(M, L);
+  }
+
+  /** 从根到该 stem 的祖先变换（不含自身）：渲染帧坐标 = M·(基点坐标) */
+  function inheritedMatrix(tree, id, base, overrides) {
+    const chain = [];
+    let cur = tree.elements.get(id);
+    while (cur && cur.type !== 'exterior') {
+      if (cur.type === 'stem') chain.unshift(cur);
+      cur = tree.elements.get(cur.parent);
+    }
+    let M = IDENT;
+    for (const s of chain) {
+      if (s.id === id) break;
+      M = localMatrixOf(tree, s, M, base, overrides);
+    }
+    return M;
+  }
+
   /**
    * 计算有效坐标：基点 → 叠加全部 overrides。
    * @param {Array<{x:number,y:number}>} base 基点坐标（自动布局或旧 manualPoints）
@@ -322,14 +348,7 @@
     const ov = overrides;
     const out = new Array(base.length);
 
-    const localMatrix = (stem, M) => {
-      const o = ov[stem.id];
-      if (!o || (!o.angle && !o.dx && !o.dy)) return M;
-      let L = IDENT;
-      if (o.angle) L = mulM(rotationAbout(o.angle, stemPivot(tree, stem.id, base)), L);
-      if (o.dx || o.dy) L = mulM(translationM(o.dx || 0, o.dy || 0), L);
-      return mulM(M, L);
-    };
+    const localMatrix = (stem, M) => localMatrixOf(tree, stem, M, base, ov);
 
     const paint = (residues, M) => {
       for (const i of residues) out[i] = applyM(M, base[i]);
@@ -359,6 +378,8 @@
     subtreeResidues,
     subtreeIds,
     stemPivot,
+    localMatrixOf,
+    inheritedMatrix,
     mulM,
     applyM,
     rotationAbout,

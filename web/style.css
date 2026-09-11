@@ -1302,3 +1302,8 @@ textarea:focus, input:focus, select:focus {
 }
 /* 仅预览选中时用中性色，暗示「不可编辑」 */
 .mode-seg button[data-edit="preview"].is-on { background: #647183; }
+
+/* 排版横幅覆盖在画布上方：自身不吃指针事件，否则会挡住画布顶部的
+   旋转手柄/碱基；只有其中的按钮保持可点。 */
+#arrange-banner { pointer-events: none; }
+#arrange-banner button { pointer-events: auto; }
