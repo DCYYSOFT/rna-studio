@@ -173,7 +173,7 @@
       }
 
       const element = {
-        id, type, residues, parent: parentId, children: childStems.map((c) => c.id),
+        id, type, residues, lo, hi, parent: parentId, children: childStems.map((c) => c.id),
       };
       return addElement(element);
     };
@@ -205,6 +205,7 @@
       const lo = s.innerPair[0] + 1;
       const hi = s.innerPair[1] - 1;
       const loop = makeLoop(`loop:${lo}-${hi}`, lo, hi, children, s.id);
+      loop.anchors = [s.innerPair[0], s.innerPair[1]];   // 连接环的两端（父 stem 内侧配对）
       stemLoops.set(s.id, loop);
       // 接线：stem 的子是它的下游环（环的 parent 已在 makeLoop 里记录）
       elements.get(s.id).children = [loop.id];
@@ -289,23 +290,31 @@
   function hasAnyOverride(overrides) {
     if (!overrides) return false;
     for (const k of Object.keys(overrides)) {
-      const o = overrides[k];
-      if (o && (o.angle || o.dx || o.dy)) return true;
+      const o = overrides[k] || {};
+      if (o.angle || o.dx || o.dy) return true;
+      if (o.bulge != null && o.bulge !== 1) return true;
+      if (o.tilt) return true;
     }
     return false;
   }
 
-  /** 丢弃失效（对应 stem 已不存在）或全零的 override */
+  /** 丢弃失效（元素不存在）或全零的 override；stem 与环分别归一化字段 */
   function pruneOverrides(tree, overrides) {
     const kept = {};
     const dropped = [];
     if (overrides) {
       for (const k of Object.keys(overrides)) {
-        const o = overrides[k];
-        const alive = tree.elements.has(k) && tree.elements.get(k).type === 'stem';
-        const nonZero = o && (o.angle || o.dx || o.dy);
-        if (alive && nonZero) kept[k] = { angle: o.angle || 0, dx: o.dx || 0, dy: o.dy || 0 };
-        else dropped.push(k);
+        const o = overrides[k] || {};
+        const el = tree.elements.get(k);
+        if (el && el.type === 'stem') {
+          const n = { angle: o.angle || 0, dx: o.dx || 0, dy: o.dy || 0 };
+          if (n.angle || n.dx || n.dy) kept[k] = n; else dropped.push(k);
+        } else if (el && el.type !== 'exterior') {
+          const n = { bulge: o.bulge == null ? 1 : o.bulge, tilt: o.tilt || 0 };
+          if (n.bulge !== 1 || n.tilt) kept[k] = n; else dropped.push(k);
+        } else {
+          dropped.push(k);
+        }
       }
     }
     return { kept, dropped };
@@ -337,11 +346,115 @@
     return M;
   }
 
+  /** 把环的未配对残基按「锚点之间」切段（锚点 = 相邻的配对残基） */
+  function loopStretches(tree, loop) {
+    const out = [];
+    if (!loop || !loop.anchors || loop.lo == null) return out;
+    const inLoop = new Set(loop.residues);
+    let s = null;
+    for (let x = loop.lo; x <= loop.hi + 1; x++) {
+      const inp = x <= loop.hi && inLoop.has(x);
+      if (inp) {
+        if (s === null) s = x;
+      } else if (s !== null) {
+        out.push({ start: s, end: x - 1, a: s - 1, b: x });
+        s = null;
+      }
+    }
+    return out;
+  }
+
+  /** 单段环的基准：弦中点 m、默认鼓出方向 n0（单位向量）、基准幅度 L0（渲染帧坐标） */
+  function stretchBaseline(pts, st) {
+    const A = pts[st.a]; const B = pts[st.b];
+    const m = { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 };
+    let cx = 0; let cy = 0;
+    for (let r = st.start; r <= st.end; r++) { cx += pts[r].x; cy += pts[r].y; }
+    const cnt = st.end - st.start + 1;
+    cx /= cnt; cy /= cnt;
+    let dx0 = cx - m.x; let dy0 = cy - m.y;
+    let L0 = Math.hypot(dx0, dy0);
+    const chord = Math.hypot(B.x - A.x, B.y - A.y) || 1e-9;
+    if (L0 < chord * 0.08) {
+      // 退化（残基几乎落在弦上）：默认取弦的垂线方向
+      dx0 = -(B.y - A.y) / chord; dy0 = (B.x - A.x) / chord;
+      L0 = chord * 0.35;
+    } else {
+      dx0 /= L0; dy0 /= L0;
+    }
+    return { A, B, m, n0: { x: dx0, y: dy0 }, L0, chord };
+  }
+
   /**
-   * 计算有效坐标：基点 → 叠加全部 overrides。
+   * 环的形变：在刚性坐标（pts，已是渲染帧）之上，把每一段未配对残基
+   * 沿二次贝塞尔重新铺开——两端锚点不动（连接不破），幅度 = k×基准，
+   * 方向 = 基准方向旋转 tilt（多段环忽略 tilt）。
+   */
+  function deformLoopTo(tree, loop, pts, o) {
+    if (!o || !loop.anchors) return;
+    const stretches = loopStretches(tree, loop);
+    if (!stretches.length) return;
+    const multi = stretches.length !== 1;
+    const k = Math.max(0.05, o.bulge == null ? 1 : o.bulge);
+    const tiltDeg = multi ? 0 : (o.tilt || 0);
+    if (k === 1 && !tiltDeg) return;
+    const th = (tiltDeg * Math.PI) / 180;
+    const c2 = Math.cos(th); const s2 = Math.sin(th);
+    for (const st of stretches) {
+      const b = stretchBaseline(pts, st);
+      const nx = c2 * b.n0.x - s2 * b.n0.y;
+      const ny = s2 * b.n0.x + c2 * b.n0.y;
+      const ctrl = { x: b.m.x + nx * 2 * k * b.L0, y: b.m.y + ny * 2 * k * b.L0 };
+      const cnt = st.end - st.start + 1;
+      for (let idx = 0; idx < cnt; idx++) {
+        const t = (idx + 1) / (cnt + 1);
+        const u = 1 - t;
+        pts[st.start + idx] = {
+          x: u * u * b.A.x + 2 * u * t * ctrl.x + t * t * b.B.x,
+          y: u * u * b.A.y + 2 * u * t * ctrl.y + t * t * b.B.y,
+        };
+      }
+    }
+  }
+
+  /**
+   * 给 UI / 测试用：环的锚点、基准方向与当前 apex（渲染帧坐标）。
+   * 基准取自「剔除本环 override」的推算结果；apex = m + R(tilt)·n0 × k×L0。
+   */
+  function loopShape(tree, loopId, base, overrides) {
+    const loop = tree.elements.get(loopId);
+    if (!loop || !loop.anchors) return null;
+    const ovAll = overrides || {};
+    const ovRigid = { ...ovAll };
+    delete ovRigid[loopId];
+    const rigid = effectivePoints(base, tree, ovRigid);
+    const stretches = loopStretches(tree, loop);
+    if (!stretches.length) return null;
+    let best = null;
+    for (const st of stretches) {
+      const b = stretchBaseline(rigid, st);
+      if (!best || b.L0 > best.L0) best = { ...b, stretch: st };
+    }
+    const o = ovAll[loopId] || {};
+    const k = Math.max(0.05, o.bulge == null ? 1 : o.bulge);
+    const tiltDeg = stretches.length === 1 ? (o.tilt || 0) : 0;
+    const th = (tiltDeg * Math.PI) / 180;
+    const c2 = Math.cos(th); const s2 = Math.sin(th);
+    const nx = c2 * best.n0.x - s2 * best.n0.y;
+    const ny = s2 * best.n0.x + c2 * best.n0.y;
+    const apex = { x: best.m.x + nx * k * best.L0, y: best.m.y + ny * k * best.L0 };
+    return {
+      anchors: loop.anchors.slice(),
+      m: best.m, n0: best.n0, L0: best.L0, chord: best.chord,
+      k, tiltDeg, apex, stretchCount: stretches.length,
+    };
+  }
+
+  /**
+   * 计算有效坐标：基点 → 叠加全部 overrides（stem 刚体变换 + 环形变）。
    * @param {Array<{x:number,y:number}>} base 基点坐标（自动布局或旧 manualPoints）
    * @param {object} tree buildStructureTree 的返回
-   * @param {object} overrides { [stemId]: {angle, dx, dy} }
+   * @param {object} overrides { [stemId]: {angle, dx, dy}, [loopId]: {bulge, tilt} }
    */
   function effectivePoints(base, tree, overrides) {
     if (!hasAnyOverride(overrides)) return base.map((p) => ({ ...p }));
@@ -363,6 +476,8 @@
     const walkLoop = (loop, M) => {
       paint(loop.residues, M);
       for (const sid of loop.children) walkStem(tree.elements.get(sid), M);
+      // 锚点（父/子 stem 的配对残基）此时都已定位，再做环形变
+      deformLoopTo(tree, loop, out, ov[loop.id]);
     };
 
     walkLoop(tree.elements.get(tree.rootId), IDENT);
@@ -380,6 +495,8 @@
     stemPivot,
     localMatrixOf,
     inheritedMatrix,
+    loopStretches,
+    loopShape,
     mulM,
     applyM,
     rotationAbout,

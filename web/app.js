@@ -110,6 +110,14 @@ function fmtDeg(deg) {
   return `${d.toFixed(1)}°`;
 }
 
+/** 环类型的中文显示名 */
+const LOOP_NAMES = {
+  hairpin: '发夹环', internal_loop: '内部环', bulge: '凸环', junction: '多重环', exterior: '外部环',
+};
+function loopName(u) {
+  return LOOP_NAMES[(u.element && u.element.type) || ''] || '环';
+}
+
 /* ────────────────────────────── DOM ────────────────────────────── */
 
 const $ = (id) => document.getElementById(id);
@@ -978,9 +986,10 @@ function onCanvasContext(ev) {
   ev.preventDefault();
   if (isReadOnly()) { toast('仅预览模式下画布已锁定，先切换编辑模式'); return; }
   if (isArrange()) {
-    // 排版模式：右键 = 重置该 stem 的整个分支布局
+    // 排版模式：右键 stem = 重置整个分支；右键环 = 重置该环形变
     const u = pickElement(i);
     if (u && u.kind === 'stem') resetBranch(u);
+    else if (u && u.kind === 'loop') resetLoopShape(u);
     return;
   }
   if (state.editMode === 'sequence') return;   // 其余只在改配对模式生效
@@ -1046,6 +1055,7 @@ function setupCanvasInteraction() {
   let arrangeTranslate = null;
 
   let rotateDrag = null;
+  let loopDrag = null;
 
   el.canvasScroll.addEventListener('pointerdown', (ev) => {
     // 旋转手柄优先于一切：它画在碱基之上，不拦的话会被当成拖动
@@ -1071,6 +1081,27 @@ function setupCanvasInteraction() {
         el.canvasScroll.setPointerCapture(ev.pointerId);
         ev.preventDefault();
         return;
+      }
+    }
+
+    // 环形变手柄（绿色）：拖 apex = 同时调鼓出（径向）与朝向（角向）
+    if (isArrange() && !isReadOnly()
+        && ev.target && ev.target.dataset && ev.target.dataset.role === 'loop') {
+      const u = state.pickedUnit;
+      const base = basePoints();
+      if (u && u.kind === 'loop' && base) {
+        const ls = RS.loopShape(structureTree(), u.id, base, state.layoutOverrides);
+        if (ls) {
+          loopDrag = {
+            unit: u, m: ls.m, n0: ls.n0,
+            L0Ref: Math.max(ls.L0, ls.chord * 0.12),
+            single: ls.stretchCount === 1, moved: false,
+          };
+          state.suppressAnim = true;
+          el.canvasScroll.setPointerCapture(ev.pointerId);
+          ev.preventDefault();
+          return;
+        }
       }
     }
 
@@ -1132,6 +1163,29 @@ function setupCanvasInteraction() {
     el.canvasScroll.setPointerCapture(ev.pointerId);
   });
   el.canvasScroll.addEventListener('pointermove', (ev) => {
+    if (loopDrag) {
+      const m = screenToModel(ev.clientX, ev.clientY);
+      const vx = m.x - loopDrag.m.x;
+      const vy = m.y - loopDrag.m.y;
+      const dist = Math.hypot(vx, vy);
+      let k = dist / loopDrag.L0Ref;
+      k = Math.min(2.5, Math.max(0.3, k));
+      let tilt = 0;
+      if (loopDrag.single && dist > 1e-9) {
+        const a0 = Math.atan2(loopDrag.n0.y, loopDrag.n0.x);
+        const a1 = Math.atan2(vy, vx);
+        tilt = ((((a1 - a0) * 180) / Math.PI) % 360 + 540) % 360 - 180;
+      }
+      state.layoutOverrides[loopDrag.unit.id] = { bulge: k, tilt };
+      loopDrag.moved = true;
+      state.suppressAnim = true;
+      state.fitPending = false;
+      render();
+      el.hoverReadout.textContent = `${loopName(loopDrag.unit)} · 鼓出 ${k.toFixed(2)}×`
+        + (loopDrag.single ? `（朝向 ${tilt.toFixed(0)}°）` : '');
+      el.hoverReadout.classList.add('is-on');
+      return;
+    }
     if (rotateDrag) {
       const m = screenToModel(ev.clientX, ev.clientY);
       const raw = Math.atan2(m.y - rotateDrag.pv.y, m.x - rotateDrag.pv.x) - rotateDrag.startAng;
@@ -1209,6 +1263,19 @@ function setupCanvasInteraction() {
     applyViewBox();
   });
   const endPan = (ev) => {
+    if (loopDrag) {
+      const l = loopDrag;
+      loopDrag = null;
+      state.suppressAnim = false;
+      el.hoverReadout.classList.remove('is-on');
+      try { el.canvasScroll.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
+      if (l.moved) {
+        pushHistory(`调整 ${loopName(l.unit)} 形变`);
+        saveSession();
+        updateArrangeBanner();   // 横幅里的鼓出/朝向读数刷新
+      }
+      return;
+    }
     if (rotateDrag) {
       const r = rotateDrag;
       rotateDrag = null;
@@ -1898,6 +1965,7 @@ function bindEvents() {
       if (hit != null) {
         const u = pickElement(hit);
         if (u && u.kind === 'stem') { resetStemAngle(u); ev.preventDefault(); }
+        else if (u && u.kind === 'loop') { resetLoopShape(u); ev.preventDefault(); }
       }
       return;
     }
@@ -3908,21 +3976,55 @@ function drawSelectionOverlay(svg, pts, r) {
     }));
   }
 
-  g.appendChild(mk('line', {
-    class: 'sel-stem', x1: hx, y1: by, x2: hx, y2: hy,
-    stroke: '#2F6FB5', 'stroke-width': r * 0.15,
-  }));
-  g.appendChild(mk('circle', {
-    class: 'sel-handle', 'data-role': 'rotate',
-    cx: hx, cy: hy, r: r * 1.15,
-    fill: '#ffffff', stroke: '#2F6FB5', 'stroke-width': r * 0.22,
-  }));
-  g.appendChild(mk('path', {
-    d: `M ${hx - r * 0.5} ${hy} a ${r * 0.5} ${r * 0.5} 0 1 1 ${r * 0.7} ${r * 0.35}`,
-    fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.18, 'pointer-events': 'none',
-  }));
-
-  state.selBox = { bx, by, bw, bh, hx, hy };
+  if (u.kind === 'stem') {
+    g.appendChild(mk('line', {
+      class: 'sel-stem', x1: hx, y1: by, x2: hx, y2: hy,
+      stroke: '#2F6FB5', 'stroke-width': r * 0.15,
+    }));
+    g.appendChild(mk('circle', {
+      class: 'sel-handle', 'data-role': 'rotate',
+      cx: hx, cy: hy, r: r * 1.15,
+      fill: '#ffffff', stroke: '#2F6FB5', 'stroke-width': r * 0.22,
+    }));
+    g.appendChild(mk('path', {
+      d: `M ${hx - r * 0.5} ${hy} a ${r * 0.5} ${r * 0.5} 0 1 1 ${r * 0.7} ${r * 0.35}`,
+      fill: 'none', stroke: '#2F6FB5', 'stroke-width': r * 0.18, 'pointer-events': 'none',
+    }));
+    state.selBox = { bx, by, bw, bh, hx, hy };
+  } else {
+    // 环：绿色形变手柄（apex）——拖它 = 鼓出 / 朝向
+    const ls = RS.loopShape(structureTree(), u.id, basePoints(), state.layoutOverrides);
+    if (ls && ls.apex) {
+      // 手柄收进视口，避免被裁掉点不到（轴线也画到收拢后的位置）
+      let ax = ls.apex.x;
+      let ay = ls.apex.y;
+      const vv = state.view;
+      const mm = r * 2.5;
+      if (ay < vv.y + mm) ay = vv.y + mm;
+      if (ay > vv.y + vv.h - mm) ay = vv.y + vv.h - mm;
+      if (ax < vv.x + mm) ax = vv.x + mm;
+      if (ax > vv.x + vv.w - mm) ax = vv.x + vv.w - mm;
+      g.appendChild(mk('line', {
+        class: 'loop-axis', x1: ls.m.x, y1: ls.m.y, x2: ax, y2: ay,
+        stroke: '#3E8E5A', 'stroke-width': r * 0.10,
+        'stroke-dasharray': `${r * 0.35} ${r * 0.4}`, opacity: '0.6', 'pointer-events': 'none',
+      }));
+      g.appendChild(mk('circle', {
+        class: 'loop-dot', cx: ls.m.x, cy: ls.m.y, r: r * 0.4,
+        fill: '#3E8E5A', stroke: '#ffffff', 'stroke-width': r * 0.12, 'pointer-events': 'none',
+      }));
+      g.appendChild(mk('circle', {
+        class: 'loop-handle', 'data-role': 'loop',
+        cx: ax, cy: ay, r: r * 1.05,
+        fill: '#ffffff', stroke: '#3E8E5A', 'stroke-width': r * 0.22,
+      }));
+      g.appendChild(mk('path', {
+        d: `M ${ax - r * 0.45} ${ay} a ${r * 0.45} ${r * 0.45} 0 1 1 ${r * 0.62} ${r * 0.3}`,
+        fill: 'none', stroke: '#3E8E5A', 'stroke-width': r * 0.16, 'pointer-events': 'none',
+      }));
+      state.selBox = { bx, by, bw, bh, hx: ax, hy: ay };
+    }
+  }
   svg.appendChild(g);
 }
 
@@ -3978,6 +4080,16 @@ function resetBranch(u) {
   toast(`已重置 ${u.label} 分支（${cleared} 处调整）`);
 }
 
+/** 双击/右键：重置该环的形变（恢复默认鼓出/朝向） */
+function resetLoopShape(u) {
+  if (!state.layoutOverrides[u.id]) { toast(`${loopName(u)}当前就是默认形状`); return; }
+  delete state.layoutOverrides[u.id];
+  pushHistory(`重置 ${loopName(u)} 形变`);
+  render();
+  saveSession();
+  toast(`${loopName(u)}已恢复默认形状`);
+}
+
 /** 选中态变化时更新横幅提示 */
 function updateArrangeBanner() {
   const u = state.pickedUnit;
@@ -4000,9 +4112,14 @@ function updateArrangeBanner() {
       + (isDet ? '重新连接' : '断开为自由图形') + '</button>'
       + sep + '<button class="link-btn" id="btn-unpick" type="button">取消选中</button>';
   } else {
+    const ls = RS.loopShape(structureTree(), u.id, basePoints(), state.layoutOverrides);
+    const cur = ls
+      ? ` · 鼓出 ${ls.k.toFixed(2)}×${ls.stretchCount === 1 && ls.tiltDeg ? ` · 朝向 ${ls.tiltDeg.toFixed(0)}°` : ''}`
+      : '';
     box.innerHTML =
-      `<b>已选中 环</b>（${u.bases.size} 个残基）`
-      + sep + '环的形变编辑在后续阶段提供'
+      `<b>已选中 ${loopName(u)}</b>（${u.bases.size} 个残基${cur}）`
+      + sep + '拖绿点调鼓出' + (ls && ls.stretchCount === 1 ? ' / 朝向' : '')
+      + sep + '双击或右键重置形状'
       + sep + '<button class="link-btn" id="btn-unpick" type="button">取消选中</button>';
   }
 

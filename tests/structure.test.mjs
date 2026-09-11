@@ -51,6 +51,17 @@ function rot(deg, p, pv) {
 }
 const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
+function centroidOf(pts, idxs) {
+  let x = 0; let y = 0;
+  for (const i of idxs) { x += pts[i].x; y += pts[i].y; }
+  return { x: x / idxs.length, y: y / idxs.length };
+}
+function distToLine(p, a, b) {
+  const dx = b.x - a.x; const dy = b.y - a.y;
+  const L = Math.hypot(dx, dy) || 1e-9;
+  return Math.abs((p.x - a.x) * dy - (p.y - a.y) * dx) / L;
+}
+
 /* ═══════════ Case 1：简单 hairpin ═══════════ */
 {
   const n = 12;
@@ -225,6 +236,96 @@ const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
   ok(pr2.kept['stem:1-10'].angle === 30 && pr2.dropped.length === 0, 'P pruneOverrides 保留有效项');
   ok(S.hasAnyOverride({}) === false && S.hasAnyOverride({ 'stem:1-10': { angle: 1 } }) === true,
     'P hasAnyOverride');
+}
+
+/* ═══════════ 环形变（bulge / tilt）═══════════ */
+{
+  // 单发夹：锚点不动、内部残基重铺、bulge 单调外扩、tilt 旋转偏移方向
+  const n = 12;
+  const tree = S.buildStructureTree([[1, 10], [2, 9]], n);
+  const base = makePts(n);
+  const loopId = 'loop:3-8';
+  ok(tree.elements.get(loopId).anchors
+    && tree.elements.get(loopId).anchors.join(',') === '2,9', 'L hairpin 锚点 = 父 stem 内侧配对');
+
+  const m = mid(base[2], base[9]);
+  const c0 = centroidOf(base, [3, 4, 5, 6, 7, 8]);
+  const d0 = distToLine(c0, base[2], base[9]);
+
+  const eff2 = S.effectivePoints(base, tree, { [loopId]: { bulge: 2 } });
+  ok(nearPt(eff2[2], base[2]) && nearPt(eff2[9], base[9]), 'L 锚点（closing pair）不动');
+  let moved = true;
+  for (let i = 3; i <= 8; i++) if (nearPt(eff2[i], base[i], 1e-9)) moved = false;
+  ok(moved, 'L 环内残基全部重新铺设');
+  const d2 = distToLine(centroidOf(eff2, [3, 4, 5, 6, 7, 8]), eff2[2], eff2[9]);
+  ok(d2 > d0 * 1.3, 'L bulge=2 明显外扩', `${(d2 / d0).toFixed(2)}×`);
+
+  const eff15 = S.effectivePoints(base, tree, { [loopId]: { bulge: 1.5 } });
+  const d15 = distToLine(centroidOf(eff15, [3, 4, 5, 6, 7, 8]), eff15[2], eff15[9]);
+  ok(d15 > d0 && d15 < d2, 'L bulge 越大鼓出越大（单调）',
+    `${d0.toFixed(2)} < ${d15.toFixed(2)} < ${d2.toFixed(2)}`);
+
+  // tilt=90°：偏移方向相对基准旋转约 90°（垂距方向正交 → cos ≈ 0）
+  const effT = S.effectivePoints(base, tree, { [loopId]: { bulge: 1, tilt: 90 } });
+  const cT = centroidOf(effT, [3, 4, 5, 6, 7, 8]);
+  const v0 = { x: c0.x - m.x, y: c0.y - m.y };
+  const vT = { x: cT.x - m.x, y: cT.y - m.y };
+  const cosang = (v0.x * vT.x + v0.y * vT.y) / (Math.hypot(v0.x, v0.y) * Math.hypot(vT.x, vT.y));
+  ok(Math.abs(cosang) < 0.06, 'L tilt=90° 偏移方向旋转 90°', `cos=${cosang.toFixed(3)}`);
+
+  // 独立复算（残基 4，bulge=2）：与渲染公式一致
+  {
+    const A = base[2]; const B = base[9];
+    const mm = mid(A, B);
+    let dx0 = c0.x - mm.x; let dy0 = c0.y - mm.y;
+    const L0 = Math.hypot(dx0, dy0);
+    dx0 /= L0; dy0 /= L0;
+    const ctrl = { x: mm.x + dx0 * 2 * 2 * L0, y: mm.y + dy0 * 2 * 2 * L0 };
+    const t = (4 - 3 + 1) / (6 + 1);
+    const u = 1 - t;
+    const exp4 = {
+      x: u * u * A.x + 2 * u * t * ctrl.x + t * t * B.x,
+      y: u * u * A.y + 2 * u * t * ctrl.y + t * t * B.y,
+    };
+    ok(nearPt(eff2[4], exp4), 'L 独立复算（残基 4 落在预期贝塞尔上）');
+  }
+
+  // loopShape（供 UI 的绿色手柄使用）
+  const shape = S.loopShape(tree, loopId, base, { [loopId]: { bulge: 2, tilt: 0 } });
+  ok(shape && near(Math.hypot(shape.apex.x - shape.m.x, shape.apex.y - shape.m.y), 2 * shape.L0, 1e-9),
+    'L loopShape.apex 幅度 = k×L0');
+  ok(shape.anchors.join(',') === '2,9' && shape.stretchCount === 1, 'L loopShape 基本信息');
+
+  // 内部环：两段分别形变；锚点含子 stem 两端；多段时 tilt 被忽略（零位移）
+  const tree3 = S.buildStructureTree([[2, 25], [3, 24], [8, 21], [9, 20]], 28);
+  const base3 = makePts(28);
+  const il = 'loop:4-23';
+  const stretches = S.loopStretches(tree3, tree3.elements.get(il));
+  ok(stretches.length === 2
+    && stretches[0].start === 4 && stretches[0].end === 7
+    && stretches[0].a === 3 && stretches[0].b === 8
+    && stretches[1].start === 22 && stretches[1].end === 23
+    && stretches[1].a === 21 && stretches[1].b === 24,
+    'L internal loop 切两段、锚点正确', JSON.stringify(stretches));
+  const effI = S.effectivePoints(base3, tree3, { [il]: { bulge: 1.6 } });
+  ok([3, 8, 21, 24].every((i) => nearPt(effI[i], base3[i])), 'L 内部环锚点（含子 stem 两端）不动');
+  ok(!nearPt(effI[5], base3[5], 1e-9) && !nearPt(effI[22], base3[22], 1e-9), 'L 两段都发生形变');
+  const effNo = S.effectivePoints(base3, tree3, { [il]: { tilt: 90 } });
+  let same = true;
+  for (let i = 0; i < 28; i++) if (!nearPt(effNo[i], base3[i], 1e-9)) same = false;
+  ok(same, 'L 多段环 tilt 不生效（bulge=1 时零位移）');
+
+  // prune：环条目支持、外部环/全零丢弃
+  const prL = S.pruneOverrides(tree, {
+    [loopId]: { bulge: 1, tilt: 0 },
+    ext: { bulge: 2 },
+    'stem:1-10': { angle: 5 },
+  });
+  ok(Object.keys(prL.kept).length === 1 && prL.kept['stem:1-10'].angle === 5
+    && prL.dropped.includes(loopId) && prL.dropped.includes('ext'),
+    'L prune：环条目归一化（全零/外部环丢弃）', JSON.stringify(prL));
+  const prL2 = S.pruneOverrides(tree, { [loopId]: { bulge: 1.5, tilt: 20 } });
+  ok(prL2.kept[loopId].bulge === 1.5 && prL2.kept[loopId].tilt === 20, 'L prune：环条目保留');
 }
 
 /* ═══════════ 汇总 ═══════════ */
