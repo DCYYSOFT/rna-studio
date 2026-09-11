@@ -559,6 +559,12 @@ textarea:focus, input:focus, select:focus {
 
 .bp-line { stroke: #2F6FB5; stroke-width: calc(var(--u) * 0.46); }
 .bp-line.is-sel { stroke-width: calc(var(--u) * 0.68); }
+/* 对照视图：只在一边出现的配对高亮成琥珀色，一眼看出差异 */
+.bp-line.is-diff { stroke: #D2912A; }
+
+/* 只读预览 / 对照视图：碱基不可点，鼠标不要给出手型提示 */
+.nt.is-static .nt-circle { cursor: default; }
+.nt.is-static .nt-circle:hover { stroke-width: calc(var(--u) * 0.28); }
 .bp-line.is-pk {
   stroke: #C0504D;
   stroke-dasharray: calc(var(--u) * 1.15) calc(var(--u) * 0.85);
@@ -672,6 +678,322 @@ textarea:focus, input:focus, select:focus {
   animation: spin .7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ══════════════════ 工具栏：开关型按钮（只读 / 对照） ══════════════════ */
+
+.tool-toggle {
+  min-width: 52px;
+  color: var(--ink-soft);
+}
+.tool-toggle:hover { background: var(--surface-2); }
+.tool-toggle.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.tool-toggle.is-on:hover { background: #28619F; }
+
+/* 只读模式提示条：夹在工具栏和画布之间，足够醒目但不刺眼 */
+.readonly-banner {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  background: #FDF4E3;
+  border-bottom: 1px solid #F0DFB8;
+  color: #7A5714;
+  font-size: 12px;
+}
+
+/* 只读时不给手型光标，避免暗示「可以点」 */
+.canvas-scroll.is-readonly { cursor: default; }
+.canvas-scroll.is-readonly #canvas .nt-circle { cursor: default; }
+
+/* ══════════════════ 对照预览（当前结构 vs MFE） ══════════════════ */
+
+.compare-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+}
+
+.compare-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.compare-title { font-size: 13px; font-weight: 600; }
+.compare-sub {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--muted-solid);
+}
+
+.compare-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line-soft);
+}
+
+.compare-pane {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+.compare-pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+.compare-pane-head .mono { color: var(--ink); font-size: 12.5px; }
+.compare-svg { flex: 1 1 auto; min-height: 0; width: 100%; height: 100%; display: block; }
+
+.compare-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+  color: var(--muted-solid);
+}
+
+/* ── 序列定位输入 ── */
+.locate-row {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0 2px;
+}
+.locate-row input {
+  flex: 1 1 auto;
+  font-size: 12px;
+  padding: 6px 9px;
+}
+.locate-row .btn { flex: 0 0 auto; padding: 6px 12px; }
+
+/* ── 区段色带（结构域标注 / 定位高亮）──
+     用 mix-blend-mode 让色带像荧光笔叠在纸上，不会盖掉下面的骨架线条 */
+.domain-band {
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+.domain-label {
+  font-family: var(--sans);
+  font-weight: 600;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ══════════════════ 展示风格：点阵图 / 彩虹配色 / 碱基对画法 ══════════════════ */
+
+/* 彩虹渐变图例条 */
+.legend-rainbow {
+  display: inline-block;
+  width: 96px; height: 9px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+  background: linear-gradient(90deg,
+    rgb(26,76,140) 0%, rgb(46,139,168) 22%, rgb(78,168,96) 42%,
+    rgb(208,176,52) 60%, rgb(206,108,52) 80%, rgb(158,48,74) 100%);
+}
+
+/* 色带画法：整段螺旋一条粗带 */
+.bp-ribbon { pointer-events: none; }
+
+/* 梯形画法：每对是一小段横杠，比连线看起来更像梯级 */
+.bp-line.is-rung { stroke-linecap: round; }
+
+/* 点阵图模式下画布不需要手型光标 */
+#canvas image { image-rendering: pixelated; }
+
+/* ══════════════════ 结构域标注 ══════════════════ */
+
+.domain-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.domain-form > input { font-size: 12.5px; padding: 6px 9px; }
+
+.domain-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.domain-range input {
+  width: 64px;
+  flex: 0 0 auto;
+  text-align: center;
+  font-size: 12.5px;
+  padding: 6px 6px;
+}
+.domain-range .dash { color: var(--muted-solid); flex: 0 0 auto; }
+.domain-range .link-btn { margin-left: auto; }
+
+.domain-list {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  margin-bottom: 2px;
+}
+.domain-list .empty { margin: 0; padding: 10px 12px; }
+
+.domain-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  cursor: pointer;
+  font-size: 12px;
+}
+.domain-row:last-child { border-bottom: none; }
+.domain-row:hover { background: var(--surface-2); }
+
+.domain-swatch {
+  flex: 0 0 auto;
+  width: 11px; height: 11px;
+  border-radius: 3px;
+}
+.domain-row-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.domain-row-range,
+.domain-row-len {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted-solid);
+}
+
+.domain-del {
+  flex: 0 0 auto;
+  width: 20px; height: 20px;
+  border: none;
+  background: none;
+  color: var(--muted-solid);
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+}
+.domain-del:hover { background: var(--danger-soft); color: var(--danger); }
+
+/* ══════════════════ 编辑历史面板 ══════════════════ */
+
+.history-list {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+}
+.history-list .empty { margin: 0; padding: 10px 12px; }
+
+.history-row {
+  font: inherit;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: none;
+  border-bottom: 1px solid var(--line-soft);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink);
+}
+.history-row:last-child { border-bottom: none; }
+.history-row:hover { background: var(--surface-2); }
+
+.history-step {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted-solid);
+  min-width: 2.2em;
+  text-align: right;
+}
+.history-label {
+  flex: 1 1 auto;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-meta {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted-solid);
+}
+
+/* 当前所在的一步 */
+.history-row.is-current {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.history-row.is-current .history-label { font-weight: 600; }
+
+/* 撤销之后被「留在未来」的步骤，弱化显示但保留，点一下就能重做 */
+.history-row.is-future { opacity: .45; }
+
+/* ══════════════════ 出图预览对话框 ══════════════════ */
+
+.dialog-wide { max-width: 1000px; }
+
+.dialog-sub {
+  margin: -10px 0 14px;
+  font-size: 12px;
+  color: var(--muted-solid);
+  line-height: 1.5;
+}
+
+.export-preview {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+  height: min(58vh, 560px);
+  padding: 10px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.export-preview svg { max-width: 100%; max-height: 100%; }
+
+.save-row { display: flex; gap: 8px; margin-left: auto; }
+
+/* ══════════════════ 窄屏适配 ══════════════════ */
+
+@media (max-width: 940px) {
+  .compare-body { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .canvas-toolbar { flex-wrap: wrap; }
+}
 
 /* ─────────────────────────────── 响应式 ─────────────────────────────── */
 

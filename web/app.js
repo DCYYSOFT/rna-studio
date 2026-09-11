@@ -33,6 +33,13 @@ const state = {
   status: null,
   view: { x: 0, y: 0, w: 100, h: 100 },
   fitPending: true,
+  readOnly: false,          // 只读预览：画布锁定，点击不修改配对
+  domains: [],              // 结构域标注 [{name, start, end, color}]，0-based 闭区间
+  locatedRange: null,       // 序列定位的高亮区间 [start, end]
+  lastRenderedPoints: null, // 上一次真正画出来的坐标，用于折叠过渡动画
+  lastRenderedPairs: [],
+  history: [],              // 结构编辑历史（快照栈）
+  historyIndex: -1,         // 当前处在历史中的位置，-1 表示还没有记录
 };
 
 const BASE_COLORS = { A: '#4E9143', C: '#2F6FB5', G: '#D2912A', U: '#BE4A47' };
@@ -56,9 +63,25 @@ const el = {
   decomp: $('decomp'),
   varnaAlgo: $('varna-algo'), colorMode: $('color-mode'),
   bpstyleWrap: $('bpstyle-wrap'), bpstyle: $('bpstyle'), periodNum: $('period-num'),
-  btnSvg: $('btn-svg'), btnPng: $('btn-png'), svgScope: $('svg-scope'),
+  btnSvg: $('btn-svg'), svgScope: $('svg-scope'),
+  btnUndo: $('btn-undo'), btnRedo: $('btn-redo'),
+  btnReadOnly: $('btn-readonly'), readonlyBanner: $('readonly-banner'),
+  btnCompare: $('btn-compare'), compareOverlay: $('compare-overlay'),
+  compareLeft: $('compare-left'), compareRight: $('compare-right'),
+  compareLeftDg: $('compare-left-dg'), compareRightDg: $('compare-right-dg'),
+  compareSummary: $('compare-summary'), compareDetail: $('compare-detail'),
+  historyList: $('history-list'),
+  locateInput: $('locate-input'), btnLocate: $('btn-locate'),
+  bpStyleDraw: $('bp-style-draw'),
+  domainName: $('domain-name'), domainStart: $('domain-start'), domainEnd: $('domain-end'),
+  domainList: $('domain-list'), btnDomainAdd: $('btn-domain-add'),
+  btnDomainFromRange: $('btn-domain-from-range'), btnFoldDomains: $('btn-fold-domains'),
+  statHistory: $('stat-history'), statHistoryPos: $('stat-history-pos'),
+  exportDialog: $('export-dialog'), exportTitle: $('export-title'),
+  exportSub: $('export-sub'), exportPreview: $('export-preview'),
+  exportError: $('export-error'), exportSaveButtons: $('export-save-buttons'),
   varnaHint: $('varna-hint'),
-  btnVarnaSvg: $('btn-varna-svg'), btnVarnaPng: $('btn-varna-png'), btnVarnaEps: $('btn-varna-eps'),
+  btnVarnaSvg: $('btn-varna-svg'),
   btnImport: $('btn-import'), importDialog: $('import-dialog'), importFmt: $('import-fmt'),
   importText: $('import-text'), importError: $('import-error'),
   mDg: $('m-dg'), mMfe: $('m-mfe'), mDd: $('m-dd'), mEngine: $('m-engine'), mLayout: $('m-layout'),
@@ -225,6 +248,13 @@ function syncSequence() {
     state.selection = null;
     state.result = null;
     state.probMap.clear();
+    state.lastRenderedPoints = null;   // 换了序列，谈不上「过渡」
+    state.domains = [];
+    state.locatedRange = null;
+    state.history = [];          // 换了序列，旧的历史没有意义
+    state.historyIndex = -1;
+    renderHistory();
+    updateHistoryButtons();
     resetConstraintString(n);
     el.statPairs.textContent = 0;
     state.fitPending = true;
@@ -265,6 +295,10 @@ function textColorOn(rgb) {
 /** 每个碱基一个着色数值；返回 null 表示用碱基种类配色 */
 function colorValues() {
   const n = state.sequence.length;
+  if (state.colorMode === 'rainbow') {
+    // 0 → 1 沿序列均匀分布，交给彩虹渐变映射
+    return Array.from({ length: n }, (_, i) => (n > 1 ? i / (n - 1) : 0));
+  }
   if (state.colorMode === 'probing') {
     if (!state.probingValues || state.probingValues.length !== n) return null;
     const vals = state.probingValues.map((v) => (v == null || v < 0 ? 0 : v));
@@ -285,6 +319,13 @@ function colorValues() {
 }
 
 function renderLegend() {
+  if (state.colorMode === 'rainbow') {
+    el.legend.innerHTML = '<span class="legend-item">5′</span>'
+      + '<span class="legend-item"><span class="legend-rainbow"></span></span>'
+      + '<span class="legend-item">3′</span>'
+      + '<span class="legend-item" style="color:var(--muted-solid)">按位置渐变着色，便于追踪链的走向</span>';
+    return;
+  }
   if (state.colorMode === 'base') {
     el.legend.innerHTML = ['A', 'C', 'G', 'U']
       .map((b) => `<span class="legend-item"><span class="legend-swatch" style="background:${BASE_COLORS[b]}"></span>${b}</span>`)
@@ -300,99 +341,191 @@ function renderLegend() {
   }
 }
 
-function render() {
-  const svg = el.canvas;
-  const n = state.sequence.length;
-  svg.innerHTML = '';
+/* ────────────────────── 通用绘制（主画布与对照视图共用） ────────────────────── */
 
-  if (!n || !state.result || !state.result.layout || !state.result.layout.points.length) {
-    el.canvasEmpty.hidden = false;
-    el.legend.innerHTML = '';
-    return;
-  }
-  el.canvasEmpty.hidden = true;
-  renderLegend();
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
-  const layout = state.result.layout;
+function mk(tag, attrs) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+/**
+ * 计算绘制所需的几何量。
+ *
+ * 所有尺寸都从「相邻碱基间距的中位数」推导：三种布局的坐标尺度相差几个
+ * 数量级（naview 约 15/碱基，环形约 0.08，线性恒为 1），用绝对尺寸会让
+ * 某种布局整个塌掉。
+ */
+function computeGeometry(layout, breaks, n) {
   const pts = layout.points;
   const b = layout.bounds;
+  const breakSet = new Set(breaks || []);
 
-  /* 所有尺寸都从「相邻碱基间距的中位数」推导。
-     不同布局的坐标尺度差了几个数量级（naview 约 15/碱基，环形约 0.08，
-     线性恒为 1），用绝对尺寸会导致某些布局整个塌掉，必须相对化。 */
-  const gapList = [];
-  const breakSet0 = new Set(state.breaks);
+  const gaps = [];
   for (let i = 0; i < n - 1; i++) {
-    if (breakSet0.has(i)) continue;
-    gapList.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
+    if (breakSet.has(i)) continue;
+    gaps.push(Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y));
   }
-  gapList.sort((p, q) => p - q);
-  const gap = gapList.length
-    ? gapList[Math.floor(gapList.length / 2)]
+  gaps.sort((p, q) => p - q);
+  const gap = gaps.length
+    ? gaps[Math.floor(gaps.length / 2)]
     : Math.max(1e-9, b.span / Math.max(n, 1));
 
-  const r = gap * 0.40;          // 碱基圆半径
-  const fs = r * 1.15;           // 碱基字母字号（略小于圆直径，避免字母顶到圈线）
+  const r = gap * 0.40;         // 碱基圆半径
   const pad = r * 4.2;
-
-  const vb = {
-    x: b.minX - pad, y: b.minY - pad,
-    w: (b.maxX - b.minX) + pad * 2, h: (b.maxY - b.minY) + pad * 2,
+  return {
+    pts, bounds: b, breakSet,
+    r,
+    fs: r * 1.15,               // 碱基字母字号（略小于圆直径）
+    pad,
+    vb: {
+      x: b.minX - pad, y: b.minY - pad,
+      w: (b.maxX - b.minX) + pad * 2, h: (b.maxY - b.minY) + pad * 2,
+    },
   };
-  if (state.fitPending) { state.view = { ...vb }; state.fitPending = false; }
-  state.fitView = { ...vb };   // 供「整幅结构」出图取景使用
-  applyViewBox();
+}
 
-  // 编号字号：几何上跟 r 走，但保证换算到屏幕像素后至少约 10px，
-  // 否则在「线性」这类间距很小的布局里数字小到看不清。
-  const cw = el.canvas.clientWidth || 1000;
-  const chh = el.canvas.clientHeight || 700;
-  const pxScale = Math.min(cw / vb.w, chh / vb.h) || 1;
-  const numFs = Math.max(r * 0.95, 10 / pxScale);
+/**
+ * 把一个结构画进指定的 <svg>。
+ *
+ * 主画布和对照视图的两个面板都走这个函数，避免两套绘制逻辑各写一遍后走偏。
+ *
+ * ctx:
+ *   sequence     序列字符串
+ *   layout       /api/layout 或预测返回的 layout 对象
+ *   pairs        [[i, j], ...]
+ *   breaks       骨架断开处
+ *   forbidden    Set<number> 禁配位点
+ *   selected     当前选中碱基索引或 null
+ *   colorMap     每碱基着色数值数组，null 表示按碱基种类配色
+ *   period       编号周期，0 表示不画编号
+ *   diffPairs    Set<'i,j'>，其中的配对会高亮（对照视图用来标出「只在一边出现」的配对）
+ *   bands        [{start, end, color, label}] 区段标注；结构域和序列定位都用它，
+ *                画成沿骨架的粗色带（像荧光笔划过），可带名字
+ *   interactive  是否响应鼠标（只读模式或对照视图里关掉）
+ */
+function drawStructure(svgEl, ctx) {
+  const {
+    sequence, layout, pairs = [], breaks = [], forbidden = new Set(),
+    selected = null, colorMap = null, period = 0, diffPairs = null,
+    bands = [], interactive = true, colorRamp = null, bpStyle = '',
+  } = ctx;
 
-  const cmap = colorValues();
-  const pm = pairMap();
-  const sel = state.selection;
-  const selPartner = sel != null ? pm.get(sel) : undefined;
-  const pkPairs = new Set();
-  if (state.result.has_pseudoknot && state.result.crossing_pairs) {
-    for (const [a, b2] of state.result.crossing_pairs) {
-      pkPairs.add(`${a[0]},${a[1]}`); pkPairs.add(`${b2[0]},${b2[1]}`);
-    }
-  }
+  const n = sequence.length;
+  svgEl.innerHTML = '';
+  if (!n || !layout || !layout.points || !layout.points.length) return null;
 
-  const NS = 'http://www.w3.org/2000/svg';
-  const mk = (tag, attrs) => {
-    const e = document.createElementNS(NS, tag);
-    for (const k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
-    return e;
-  };
-
-  const breakSet = new Set(state.breaks);
-  const isLinear = layout.layout === 'linear';
+  const { pts, r, fs, vb, breakSet } = computeGeometry(layout, breaks, n);
 
   // 把坐标尺度暴露给 CSS：所有线宽/虚线间隔都写成 --u 的倍数，
   // 这样在 naview / 环形 / 线性三种尺度下都不会失控。
-  el.canvas.style.setProperty('--u', String(r));
+  svgEl.style.setProperty('--u', String(r));
+  svgEl.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+  svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  // 编号字号：几何上跟 r 走，但保证换算到屏幕像素后至少约 10px，
+  // 否则在「线性」这类间距很小的布局里数字会小到看不清。
+  const cw = svgEl.clientWidth || 1000;
+  const chh = svgEl.clientHeight || 700;
+  const pxScale = Math.min(cw / vb.w, chh / vb.h) || 1;
+  const numFs = Math.max(r * 0.95, 10 / pxScale);
+
+  const pm = new Map();
+  for (const [i, j] of pairs) { pm.set(i, j); pm.set(j, i); }
+  const selPartner = selected != null ? pm.get(selected) : undefined;
+  const isLinear = layout.layout === 'linear';
 
   /* 1. 骨架 */
   const gBack = mk('g', { class: 'backbone-group' });
   for (let i = 0; i < n - 1; i++) {
     if (breakSet.has(i)) continue;
     gBack.appendChild(mk('line', {
-      class: 'backbone',
+      class: 'backbone', 'data-i': i,
       x1: pts[i].x, y1: pts[i].y, x2: pts[i + 1].x, y2: pts[i + 1].y,
     }));
   }
-  svg.appendChild(gBack);
+  svgEl.appendChild(gBack);
+
+  /* 1.5 区段标注：沿骨架铺一条粗色带，像荧光笔划过。
+     画在碱基之下，所以不会挡住字母；半透明让骨架仍可见。 */
+  if (bands.length) {
+    const gBand = mk('g', {});
+    for (const bd of bands) {
+      const bs = Math.max(0, bd.start | 0);
+      const be = Math.min(n - 1, bd.end | 0);
+      if (be <= bs) continue;
+      const poly = [];
+      for (let i = bs; i <= be; i++) poly.push(`${pts[i].x},${pts[i].y}`);
+      gBand.appendChild(mk('polyline', {
+        class: 'domain-band',
+        points: poly.join(' '),
+        stroke: bd.color || '#2F6FB5',
+        'stroke-width': r * 1.25,
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+        fill: 'none',
+        opacity: 0.5,
+      }));
+    }
+    svgEl.appendChild(gBand);
+  }
 
   /* 2. 配对 */
   const gPairs = mk('g', {});
-  for (const [i, j] of state.pairs) {
+
+  // 「色带」画法：把连续堆叠的螺旋合并成一条粗带，看起来就像螺旋本身。
+  let ribbonRuns = null;
+  if (bpStyle === 'ribbon') {
+    const sorted = [...pairs].filter(([i, j]) => i < pts.length && j < pts.length)
+      .map(([i, j]) => (i < j ? [i, j] : [j, i])).sort((a, b) => a[0] - b[0]);
+    ribbonRuns = [];
+    let run = null;
+    for (const [i, j] of sorted) {
+      if (run && i === run[run.length - 1][0] + 1 && j === run[run.length - 1][1] - 1) {
+        run.push([i, j]);
+      } else { run = [[i, j]]; ribbonRuns.push(run); }
+    }
+  }
+  const inRibbon = new Set();
+  if (ribbonRuns) {
+    for (const run of ribbonRuns) {
+      for (const [i, j] of run) inRibbon.add(`${i},${j}`);
+      if (run.length < 2) continue;
+      const mids = run.map(([i, j]) => `${(pts[i].x + pts[j].x) / 2},${(pts[i].y + pts[j].y) / 2}`);
+      gPairs.appendChild(mk('polyline', {
+        class: 'bp-ribbon', points: mids.join(' '),
+        'stroke-width': r * 1.9, stroke: '#2F6FB5',
+        'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        fill: 'none', opacity: 0.5,
+      }));
+    }
+  }
+
+  for (const [i, j] of pairs) {
     if (i >= pts.length || j >= pts.length) continue;
-    const isPk = pkPairs.has(`${i},${j}`) || pkPairs.has(`${j},${i}`);
-    const inSel = sel != null && (i === sel || j === sel);
-    const cls = 'bp-line' + (isPk ? ' is-pk' : '') + (inSel ? ' is-sel' : '');
+    const inSel = selected != null && (i === selected || j === selected);
+    const isDiff = diffPairs ? diffPairs.has(`${i},${j}`) : false;
+    const cls = 'bp-line' + (isDiff ? ' is-diff' : '') + (inSel ? ' is-sel' : '');
+
+    // 梯形画法：每对画成一小段横杠，视觉上像螺旋的梯级
+    if (bpStyle === 'ladder') {
+      const mx = (pts[i].x + pts[j].x) / 2;
+      const my = (pts[i].y + pts[j].y) / 2;
+      const dx = pts[j].x - pts[i].x, dy = pts[j].y - pts[i].y;
+      const len = Math.hypot(dx, dy) || 1;
+      const hw = Math.min(len * 0.24, r * 0.9);
+      gPairs.appendChild(mk('line', {
+        class: cls + ' is-rung',
+        x1: mx - (dx / len) * hw, y1: my - (dy / len) * hw,
+        x2: mx + (dx / len) * hw, y2: my + (dy / len) * hw,
+        opacity: inSel ? 1 : 0.95,
+        'data-a': Math.min(i, j), 'data-b': Math.max(i, j),
+      }));
+      continue;
+    }
+    if (bpStyle === 'ribbon' && inRibbon.has(`${i},${j}`)) continue;
     if (isLinear) {
       // 线性布局：配对画成上方的半圆弧（sweep=1 在屏幕坐标系里向上鼓），
       // 否则会与骨架线和碱基重叠。
@@ -401,44 +534,43 @@ function render() {
       gPairs.appendChild(mk('path', {
         d: `M ${pts[i].x} ${pts[i].y} A ${rad} ${rad} 0 0 1 ${pts[j].x} ${pts[j].y}`,
         fill: 'none', class: cls, opacity: inSel ? 1 : 0.85,
+        'data-a': Math.min(i, j), 'data-b': Math.max(i, j),
       }));
     } else {
       gPairs.appendChild(mk('line', {
         class: cls,
         x1: pts[i].x, y1: pts[i].y, x2: pts[j].x, y2: pts[j].y,
         opacity: inSel ? 1 : 0.85,
+        'data-a': Math.min(i, j), 'data-b': Math.max(i, j),
       }));
     }
   }
-  svg.appendChild(gPairs);
+  svgEl.appendChild(gPairs);
 
   /* 3. 碱基 */
   const gNt = mk('g', {});
-
   for (let i = 0; i < n; i++) {
     const p = pts[i];
-    const base = state.sequence[i] || 'N';
-    const g = mk('g', { class: 'nt' });
-    if (i === sel) g.classList.add('is-selected');
+    const base = sequence[i] || 'N';
+    const g = mk('g', { class: 'nt', 'data-i': i });
+    if (i === selected) g.classList.add('is-selected');
     else if (selPartner === i) g.classList.add('is-partnered');
-    if (state.forbidden.has(i)) g.classList.add('is-forbidden');
+    if (forbidden.has(i)) g.classList.add('is-forbidden');
+    if (!interactive) g.classList.add('is-static');
 
-    const isColored = !!cmap;
-    const rgb = isColored ? colorForValue(cmap[i]) : null;
-
+    const rgb = colorMap ? (colorRamp || colorForValue)(colorMap[i]) : null;
     g.appendChild(mk('circle', {
       class: 'nt-circle',
       cx: p.x, cy: p.y, r,
       fill: rgb ? rgbCss(rgb) : '#FFFFFF',
-      stroke: isColored ? '#5A6675' : (BASE_COLORS[base] || '#8A93A0'),
+      stroke: colorMap ? '#5A6675' : (BASE_COLORS[base] || '#8A93A0'),
       'stroke-width': r * 0.28,
       'data-i': i,
     }));
     const t = mk('text', {
       class: 'nt-text',
       x: p.x, y: p.y,
-      'text-anchor': 'middle',
-      'dominant-baseline': 'central',
+      'text-anchor': 'middle', 'dominant-baseline': 'central',
       'font-size': fs,
       fill: rgb ? textColorOn(rgb) : (BASE_COLORS[base] || '#4A5563'),
     });
@@ -446,10 +578,41 @@ function render() {
     g.appendChild(t);
     gNt.appendChild(g);
   }
-  svg.appendChild(gNt);
+  svgEl.appendChild(gNt);
 
-  /* 4. 编号（每 period 个） */
-  const period = parseInt(el.periodNum.value, 10) || 0;
+  /* 3.5 区段名字：沿背离结构中心方向偏移，与编号同一套逻辑 */
+  if (bands.length) {
+    const gLabel = mk('g', {});
+    const cx0 = pts.reduce((t, q) => t + q.x, 0) / n;
+    const cy0 = pts.reduce((t, q) => t + q.y, 0) / n;
+    for (const bd of bands) {
+      if (!bd.label) continue;
+      const bs = Math.max(0, bd.start | 0);
+      const be = Math.min(n - 1, bd.end | 0);
+      if (be <= bs) continue;
+      const mid = (bs + be) >> 1;
+      const pm = pts[mid];
+      const prev = pts[Math.max(0, mid - 1)];
+      let dx = pm.x - prev.x, dy = pm.y - prev.y;
+      const len = Math.hypot(dx, dy) || 1;
+      dx /= len; dy /= len;
+      let nx = -dy, ny = dx;
+      if ((pm.x - cx0) * nx + (pm.y - cy0) * ny < 0) { nx = -nx; ny = -ny; }
+      const off = r * 3.4;
+      const t = mk('text', {
+        class: 'domain-label',
+        x: pm.x + nx * off, y: pm.y + ny * off,
+        'text-anchor': 'middle', 'dominant-baseline': 'middle',
+        'font-size': r * 1.35,
+        fill: bd.color || '#2F6FB5',
+      });
+      t.textContent = bd.label;
+      gLabel.appendChild(t);
+    }
+    svgEl.appendChild(gLabel);
+  }
+
+  /* 4. 编号 */
   if (period > 0 && n > 0) {
     const gNum = mk('g', {});
     const cx0 = pts.reduce((s, q) => s + q.x, 0) / n;
@@ -470,9 +633,10 @@ function render() {
       if ((p.x - cx0) * nx + (p.y - cy0) * ny < 0) { nx = -nx; ny = -ny; }
       const off = r * out;
       const t = mk('text', {
-        class: 'nt-num',
-        x: p.x + nx * off,
-        y: p.y + ny * off,
+        class: 'nt-num', 'data-i': idx,
+        // 记录偏移量，动画时按同样的方向跟着碱基走
+        'data-ox': nx * off, 'data-oy': ny * off,
+        x: p.x + nx * off, y: p.y + ny * off,
         'text-anchor': 'middle', 'dominant-baseline': 'middle',
         'font-size': numFs,
       });
@@ -492,8 +656,69 @@ function render() {
       );
       if (lastLabeled < 0 || dist > r * 3.2) gNum.appendChild(labelAt(n - 1, 2.1));
     }
-    svg.appendChild(gNum);
+    svgEl.appendChild(gNum);
   }
+
+  return { vb, r };
+}
+
+/** 主画布渲染 */
+function render() {
+  const n = state.sequence.length;
+
+  // 点阵图是完全不同的呈现方式，不走结构布局那套
+  if (el.layout.value === 'dotplot') {
+    if (n) void drawDotPlot();
+    else { el.canvas.innerHTML = ''; el.canvasEmpty.hidden = false; }
+    return;
+  }
+
+  if (!n || !state.result || !state.result.layout || !state.result.layout.points.length) {
+    el.canvasEmpty.hidden = false;
+    el.legend.innerHTML = '';
+    el.canvas.innerHTML = '';
+    return;
+  }
+  el.canvasEmpty.hidden = true;
+  renderLegend();
+
+  const geo = drawStructure(el.canvas, {
+    sequence: state.sequence,
+    layout: state.result.layout,
+    pairs: state.pairs,
+    breaks: state.breaks,
+    forbidden: state.forbidden,
+    selected: state.selection,
+    colorMap: colorValues(),
+    period: parseInt(el.periodNum.value, 10) || 0,
+    bands: activeBands(),
+    interactive: !state.readOnly,
+    colorRamp: state.colorMode === 'rainbow' ? rainbowColor : null,
+    bpStyle: el.bpStyleDraw ? el.bpStyleDraw.value : '',
+  });
+
+  if (!geo) return;
+  if (state.fitPending) { state.view = { ...geo.vb }; state.fitPending = false; }
+  state.fitView = { ...geo.vb };   // 供「整幅结构」出图取景使用
+  applyViewBox();
+
+  // 折叠过渡动画：让碱基从上一帧的位置弹性地滑到新位置。
+  // 若位置没有实质变化（如只是切换配色）就跳过，免得白跑一遍。
+  const newPts = state.result.layout.points;
+  const prevPts = state.lastRenderedPoints;
+  let moved = false;
+  if (prevPts && prevPts.length === newPts.length) {
+    for (let i = 0; i < newPts.length; i++) {
+      if (Math.hypot(newPts[i].x - prevPts[i].x, newPts[i].y - prevPts[i].y) > 1e-6) {
+        moved = true; break;
+      }
+    }
+  }
+  if (moved) {
+    animateFold(el.canvas, prevPts, newPts, state.lastRenderedPairs, state.pairs);
+  }
+  state.lastRenderedPoints = newPts.map((q) => ({ x: q.x, y: q.y }));
+  state.lastRenderedPairs = state.pairs.map((q) => [q[0], q[1]]);
 }
 
 function applyViewBox() {
@@ -535,6 +760,7 @@ let editTimer = null;
 function onCanvasClick(ev) {
   const i = baseFromEvent(ev);
   if (i == null) return;
+  if (state.readOnly) { toast('只读预览中，先退出再编辑'); return; }   // 防误改
 
   if (ev.altKey || ev.shiftKey) {
     if (state.forbidden.has(i)) state.forbidden.delete(i);
@@ -545,6 +771,7 @@ function onCanvasClick(ev) {
     arr[i] = state.forbidden.has(i) ? 'x' : '.';
     el.constraints.value = arr.join('');
     syncConstraintReadouts();
+    pushHistory(state.forbidden.has(i) ? `标记 #${i + 1} 禁止配对` : `取消 #${i + 1} 的禁配标记`);
     render();
     return;
   }
@@ -570,6 +797,7 @@ function onCanvasClick(ev) {
   state.pairs.sort((p, q) => p[0] - q[0]);
   state.forbidden.delete(a); state.forbidden.delete(b);
 
+  pushHistory(`建立配对 #${a + 1}–#${b + 1}`);
   render();
   scheduleEvaluate();
 }
@@ -578,9 +806,15 @@ function onCanvasContext(ev) {
   const i = baseFromEvent(ev);
   if (i == null) return;
   ev.preventDefault();
+  if (state.readOnly) { toast('只读预览中，先退出再编辑'); return; }
+
+  const partner = pairMap().get(i);
   const before = state.pairs.length;
   state.pairs = state.pairs.filter(([x, y]) => x !== i && y !== i);
   if (state.pairs.length !== before) {
+    pushHistory(partner != null
+      ? `解除配对 #${Math.min(i, partner) + 1}–#${Math.max(i, partner) + 1}`
+      : `移除 #${i + 1} 的配对`);
     render();
     scheduleEvaluate();
   }
@@ -680,7 +914,9 @@ function renderMeter(result) {
     el.mEngine.textContent = '—'; el.mLayout.textContent = '—';
     return;
   }
-  if (result.infeasible) {
+  if (result.has_pseudoknot) {
+    el.mDg.textContent = '含假结'; el.mDg.className = 'meter-value is-na';
+  } else if (result.infeasible) {
     el.mDg.textContent = '不可行'; el.mDg.className = 'meter-value is-infeasible';
   } else if (e == null) {
     el.mDg.textContent = '未计算'; el.mDg.className = 'meter-value is-na';
@@ -689,8 +925,9 @@ function renderMeter(result) {
   }
 
   el.mMfe.textContent = (result.mfe_energy != null) ? result.mfe_energy.toFixed(2) : '—';
-  // 结构不可行时 ΔΔG 是 +99998 这种无意义的数，直接不显示
-  if (result.delta_from_mfe != null && !result.infeasible && e != null) {
+  // 结构不可行或含假结时 ΔΔG 没有意义，直接不显示
+  if (result.delta_from_mfe != null && !result.infeasible
+      && !result.has_pseudoknot && e != null) {
     const d = result.delta_from_mfe;
     el.mDd.textContent = (d > 0 ? '+' : '') + d.toFixed(2);
     el.mDd.style.color = d > 0.05 ? '#E08C82' : (Math.abs(d) <= 0.05 ? '#A9D9BC' : '#DCE3EC');
@@ -759,6 +996,7 @@ function adoptResult(data, { keepSelection = false } = {}) {
   el.statPairs.textContent = state.pairs.length;
   el.outStruct.textContent = data.structure;
   el.outSeq.textContent = state.sequence;
+  saveSession();
 
   renderMeter(data);
   renderDecomposition(data);
@@ -842,12 +1080,16 @@ async function doFold() {
       });
       state.fitPending = true;
       adoptResult(data);
+      pushHistory(`共折叠（链间配对 ${data.interstrand_pairs.length} 个）`);
       reportNotes(data);
       toast(`共折叠完成 · 链间配对 ${data.interstrand_pairs.length} 个`);
     } else {
       const data = await api('/api/predict', body);
       state.fitPending = true;
       adoptResult(data);
+      pushHistory(data.engine === 'rnastructure'
+        ? `折叠（${el.method.value}）`
+        : '折叠（MFE）');
       reportNotes(data);
       toast(data.infeasible ? '完成（结构不可行）' : `完成 · ΔG ${data.energy?.toFixed(2)} kcal/mol`);
     }
@@ -875,6 +1117,13 @@ async function doEvaluate() {
 
   const structure = pairsToStructure(state.sequence.length, state.pairs);
   el.outStruct.textContent = structure;
+
+  // 假结：后端会返回 400，这里先本地识别，改成有解释的提示
+  const crossings = findCrossings(state.pairs);
+  if (crossings.length) {
+    await showPseudoknot(crossings, structure);
+    return;
+  }
 
   if (evalAbort) evalAbort.abort?.();
   const ctrl = new AbortController();
@@ -962,6 +1211,10 @@ function setMode(mode) {
     el.outStruct.textContent = pairsToStructure(state.sequence.length, []);
     el.canvas.innerHTML = '';
     el.canvasEmpty.hidden = false;
+    state.history = [];        // 从零开始搭，历史也从头记
+    state.historyIndex = -1;
+    renderHistory();
+    updateHistoryButtons();
     if (state.sequence) void bootManualLayout();
   } else if (el.layout.value === 'linear') {
     // 从手动建模切回来时恢复经典布局
@@ -1008,7 +1261,6 @@ function downloadBlob(blob, filename) {
 
 /* ─────────────────── 内置出图（不依赖 Java） ─────────────────── */
 
-const SVG_NS = 'http://www.w3.org/2000/svg';
 
 /** 当前渲染用的 --u（碱基圆半径），CSS 里的线宽都是它的倍数 */
 function unitScale() {
@@ -1067,49 +1319,6 @@ function buildExportSvg(scope) {
     + new XMLSerializer().serializeToString(clone) + '\n';
 }
 
-function exportSvg() {
-  const scope = el.svgScope ? el.svgScope.value : 'full';
-  const svg = buildExportSvg(scope);
-  if (!svg) { toast('还没有结构可以导出'); return; }
-  downloadBlob(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), 'rna_structure.svg');
-  toast('已导出 SVG（矢量，可直接插入论文）');
-}
-
-async function exportPng() {
-  const scope = el.svgScope ? el.svgScope.value : 'full';
-  const svg = buildExportSvg(scope);
-  if (!svg) { toast('还没有结构可以导出'); return; }
-
-  const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }));
-  try {
-    const img = new Image();
-    await new Promise((resolve, reject) => {
-      img.onload = resolve;
-      img.onerror = () => reject(new Error('SVG 光栅化失败'));
-      img.src = url;
-    });
-    const scale = 3;   // 3 倍超采样，出图为高清
-    const w = Math.max(1, Math.round((img.naturalWidth || 1000) * scale));
-    const h = Math.max(1, Math.round((img.naturalHeight || 1000) * scale));
-    const cv = document.createElement('canvas');
-    cv.width = w; cv.height = h;
-    const ctx = cv.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, w, h);
-    ctx.drawImage(img, 0, 0, w, h);
-    const blob = await new Promise((resolve) => cv.toBlob(resolve, 'image/png'));
-    if (!blob) throw new Error('浏览器未能生成 PNG');
-    downloadBlob(blob, 'rna_structure.png');
-    toast(`已导出 PNG（${w}×${h}）`);
-  } catch (e) {
-    // 少数浏览器会把 SVG 画布标记为污染而拒绝导出，这时退化为 SVG
-    addMessage('warn', `PNG 导出失败（${e.message}），请改用「导出 SVG」。`);
-    toast('PNG 导出失败，已提示改用 SVG');
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
 async function exportStructure(fmt) {
   if (!state.sequence) { toast('还没有序列'); return; }
   const structure = pairsToStructure(state.sequence.length, state.pairs);
@@ -1125,47 +1334,6 @@ async function exportStructure(fmt) {
     downloadBlob(blob, `rna.${ext}`);
     toast(`已导出 ${ext.toUpperCase()}`);
   } catch (e) { toast('导出失败：' + e.message); }
-}
-
-async function varnaRender(fmt) {
-  if (!state.sequence) { toast('还没有序列'); return; }
-  const structure = pairsToStructure(state.sequence.length, state.pairs);
-  const cmap = colorValues();
-  setBusy(true, 'VARNA 出图中…');
-  try {
-    const body = {
-      sequence: state.sequence,
-      structure,
-      algorithm: el.varnaAlgo.value,
-      period_num: parseInt(el.periodNum.value, 10) || 10,
-      bp_style: el.bpstyle.value || null,
-      color_values: cmap,
-      color_style: '0:#FFFFFF;0.5:#4E93CF;1:#143A63',
-      color_min: 0, color_max: 1,
-    };
-    const res = await fetch(`/api/render/varna?fmt=${fmt}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      let msg = t;
-      try { msg = JSON.parse(t).detail || t; } catch { /* keep */ }
-      throw new Error(msg);
-    }
-    const blob = await res.blob();
-    if (fmt === 'svg') {
-      // 同时下载并把 SVG 展示到画布，方便直接核对
-      downloadBlob(blob, 'rna_varna.svg');
-    } else {
-      downloadBlob(blob, `rna_varna.${fmt}`);
-    }
-    toast(`VARNA 已导出 ${fmt.toUpperCase()}`);
-  } catch (e) {
-    addMessage('error', 'VARNA 出图失败：' + e.message);
-    toast('VARNA 出图失败');
-  } finally { setBusy(false); }
 }
 
 /* ─────────────────────────── 环境状态 ─────────────────────────── */
@@ -1245,12 +1413,16 @@ function bindEvents() {
     await doFold();
   });
   el.btnReset.addEventListener('click', () => {
+    clearSession();
     el.seq.value = ''; el.seqB.value = '';
     syncSequence();
     state.result = null; state.pairs = [];
     renderMeter(null); renderDecomposition(null);
     el.canvas.innerHTML = ''; el.canvasEmpty.hidden = false;
     el.outStruct.textContent = ''; el.outSeq.textContent = '';
+    state.domains = [];
+    state.locatedRange = null;
+    renderDomains();
     clearMessages();
   });
 
@@ -1268,12 +1440,18 @@ function bindEvents() {
 
   el.modeBtns.forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
-  el.engine.addEventListener('change', () => { refreshMethodOptions(); });
+  el.engine.addEventListener('change', () => { refreshMethodOptions(); saveSession(); });
+  el.method.addEventListener('change', saveSession);
+  el.temperature.addEventListener('change', saveSession);
+  el.probingMethod.addEventListener('change', saveSession);
   el.layout.addEventListener('change', () => {
     state.layout = el.layout.value;
     state.fitPending = true;
-    if (state.result) { void rerender(); }
+    saveSession();
+    if (el.layout.value === 'dotplot') { void drawDotPlot(); return; }
+    if (state.result) { void rerender(); } else { render(); }
   });
+  if (el.bpStyleDraw) el.bpStyleDraw.addEventListener('change', () => { render(); saveSession(); });
   el.colorMode.addEventListener('change', () => {
     state.colorMode = el.colorMode.value;
     el.bpstyleWrap.hidden = state.colorMode === 'base';
@@ -1288,11 +1466,8 @@ function bindEvents() {
     b.addEventListener('click', () => exportStructure(b.dataset.export));
   });
 
-  el.btnSvg.addEventListener('click', exportSvg);
-  el.btnPng.addEventListener('click', () => { void exportPng(); });
-  el.btnVarnaSvg.addEventListener('click', () => varnaRender('svg'));
-  el.btnVarnaPng.addEventListener('click', () => varnaRender('png'));
-  el.btnVarnaEps.addEventListener('click', () => varnaRender('eps'));
+  el.btnSvg.addEventListener('click', () => { void openBuiltinExportPreview(); });
+  el.btnVarnaSvg.addEventListener('click', () => { void openVarnaExportPreview(); });
 
   el.btnImport.addEventListener('click', () => {
     el.importError.hidden = true;
@@ -1314,17 +1489,112 @@ function bindEvents() {
     }
   });
 
+  // ── 结构域标注 ──
+  el.btnDomainAdd.addEventListener('click', addDomain);
+  el.btnDomainFromRange.addEventListener('click', fillRangeFromLocated);
+  el.btnFoldDomains.addEventListener('click', () => { void foldByDomains(); });
+  el.domainName.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); addDomain(); }
+  });
+  el.domainList.addEventListener('click', (ev) => {
+    const del = ev.target.closest('[data-del]');
+    if (del) { removeDomain(parseInt(del.dataset.del, 10)); return; }
+    const row = ev.target.closest('.domain-row');
+    if (!row) return;
+    const d = state.domains[parseInt(row.dataset.idx, 10)];
+    if (!d) return;
+    state.locatedRange = [d.start, d.end];
+    state.fitPending = false;
+    render();
+    centerOn(d.start);
+  });
+
+  // ── 序列定位 ──
+  el.btnLocate.addEventListener('click', locateInSequence);
+  el.locateInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); locateInSequence(); }
+  });
+
+  // ── 撤销 / 重做 ──
+  el.btnUndo.addEventListener('click', undo);
+  el.btnRedo.addEventListener('click', redo);
+
+  // ── 只读预览 / 对照预览 ──
+  el.btnReadOnly.addEventListener('click', () => setReadOnly(!state.readOnly));
+  el.btnCompare.addEventListener('click', () => {
+    if (el.compareOverlay.hidden) void openCompare();
+    else closeCompare();
+  });
+  $('compare-close').addEventListener('click', closeCompare);
+
+  // ── 历史面板：点任意一步跳过去（用事件委托，行是动态生成的）──
+  el.historyList.addEventListener('click', (ev) => {
+    const row = ev.target.closest('.history-row');
+    if (!row) return;
+    const idx = parseInt(row.dataset.idx, 10);
+    if (!Number.isNaN(idx) && idx !== state.historyIndex) applyHistory(idx);
+  });
+
+  // ── 出图预览对话框 ──
+  el.exportCancel = $('export-cancel');
+  el.exportCancel.addEventListener('click', () => el.exportDialog.close());
+  el.exportSaveButtons.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('[data-export-fmt]');
+    if (btn) void saveExport(btn.dataset.exportFmt);
+  });
+
   el.btnStatus.addEventListener('click', () => {
     el.statusPanel.hidden = !el.statusPanel.hidden;
     el.btnStatus.setAttribute('aria-expanded', String(!el.statusPanel.hidden));
   });
 
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && state.selection != null) {
-      state.selection = null;
-      render();
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((ev.target.tagName || '').toUpperCase());
+    const mod = ev.metaKey || ev.ctrlKey;
+
+    if (ev.key === 'Escape') {
+      if (!el.compareOverlay.hidden) { closeCompare(); return; }
+      if (!el.exportDialog.open && state.selection != null) { state.selection = null; render(); }
+      return;
     }
-    if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') { ev.preventDefault(); void doFold(); }
+    if (mod && ev.key === 'Enter') { ev.preventDefault(); void doFold(); return; }
+
+    if (typing) return;   // 在输入框里打字时不抢快捷键
+
+    // 撤销 / 重做：加上 shift 才是重做
+    if (mod && (ev.key === 'z' || ev.key === 'Z')) {
+      ev.preventDefault();
+      if (ev.shiftKey) redo(); else undo();
+      return;
+    }
+    if (mod && (ev.key === 'y' || ev.key === 'Y')) { ev.preventDefault(); redo(); return; }
+
+    // Delete / Backspace：解除当前选中碱基的配对
+    if ((ev.key === 'Delete' || ev.key === 'Backspace') && state.selection != null) {
+      ev.preventDefault();
+      const i = state.selection;
+      const partner = pairMap().get(i);
+      if (partner == null) { toast(`#${i + 1} 没有配对`); return; }
+      const before = state.pairs.length;
+      state.pairs = state.pairs.filter(([x, y]) => x !== i && y !== i);
+      if (state.pairs.length !== before) {
+        pushHistory(`解除配对 #${Math.min(i, partner) + 1}–#${Math.max(i, partner) + 1}`);
+        state.selection = null;
+        render();
+        scheduleEvaluate();
+      }
+      return;
+    }
+
+    // 方向键：在当前选中上左右移动
+    if (state.selection != null && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) {
+      ev.preventDefault();
+      const n = state.sequence.length;
+      const step = ev.key === 'ArrowRight' ? 1 : -1;
+      state.selection = (state.selection + step + n) % n;
+      render();
+      return;
+    }
   });
 
   el.canvasScroll.addEventListener('dblclick', fitView);
@@ -1358,17 +1628,1195 @@ async function doEvaluateWithStructure(structure) {
   });
   state.fitPending = true;
   adoptResult(data);
+  pushHistory('导入结构');
   reportNotes(data);
 }
+
+/* ═══════════════════════ 编辑历史（撤销 / 重做） ═══════════════════════ */
+
+/**
+ * 历史栈记录的是「结构快照」：配对表 + 禁配标记。
+ * 用指针（historyIndex）而不是双栈，因为历史面板还需要能跳回任意一步。
+ */
+const HISTORY_LIMIT = 300;
+
+function snapshot(label) {
+  return {
+    pairs: state.pairs.map((p) => [p[0], p[1]]),
+    forbidden: new Set(state.forbidden),
+    label,
+  };
+}
+
+function pushHistory(label) {
+  // 在历史中途做了新编辑 → 丢弃后面那条 redo 分支
+  state.history = state.history.slice(0, state.historyIndex + 1);
+  state.history.push(snapshot(label));
+  if (state.history.length > HISTORY_LIMIT) state.history.shift();
+  state.historyIndex = state.history.length - 1;
+  renderHistory();
+  updateHistoryButtons();
+  saveSession();
+}
+
+function applyHistory(idx) {
+  if (idx < 0 || idx >= state.history.length) return;
+  state.historyIndex = idx;
+  const h = state.history[idx];
+  state.pairs = h.pairs.map((p) => [p[0], p[1]]);
+  state.forbidden = new Set(h.forbidden);
+  state.selection = null;
+  render();
+  renderHistory();
+  updateHistoryButtons();
+  scheduleEvaluate();
+}
+
+function undo() {
+  if (state.historyIndex > 0) applyHistory(state.historyIndex - 1);
+}
+
+function redo() {
+  if (state.historyIndex < state.history.length - 1) applyHistory(state.historyIndex + 1);
+}
+
+function updateHistoryButtons() {
+  el.btnUndo.disabled = state.historyIndex <= 0;
+  el.btnRedo.disabled = state.historyIndex >= state.history.length - 1;
+}
+
+function renderHistory() {
+  const list = el.historyList;
+  const n = state.history.length;
+  el.statHistory.textContent = n;
+  el.statHistoryPos.textContent = n ? state.historyIndex + 1 : 0;
+
+  if (!n) {
+    list.innerHTML = '<p class="empty">还没有编辑记录。折叠或改动配对后会出现在这里。</p>';
+    return;
+  }
+  // 倒序显示，最新的一步在最上面（符合直觉）
+  const rows = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const h = state.history[i];
+    const cur = i === state.historyIndex;
+    const future = i > state.historyIndex;
+    rows.push(
+      `<button class="history-row${cur ? ' is-current' : ''}${future ? ' is-future' : ''}" `
+      + `data-idx="${i}" type="button">`
+      + `<span class="history-step">${i + 1}</span>`
+      + `<span class="history-label">${escapeHtml(h.label)}</span>`
+      + `<span class="history-meta">${h.pairs.length} 对</span>`
+      + `</button>`,
+    );
+  }
+  list.innerHTML = rows.join('');
+}
+
+/* ═══════════════════════════ 只读预览 ═══════════════════════════ */
+
+function setReadOnly(on) {
+  state.readOnly = !!on;
+  el.btnReadOnly.setAttribute('aria-pressed', String(state.readOnly));
+  el.btnReadOnly.classList.toggle('is-on', state.readOnly);
+  el.readonlyBanner.hidden = !state.readOnly;
+  el.canvasScroll.classList.toggle('is-readonly', state.readOnly);
+  render();
+  toast(state.readOnly ? '已进入只读预览，画布已锁定' : '已退出只读预览，可以继续编辑');
+}
+
+/* ═══════════════════════ 出图预览对话框 ═══════════════════════ */
+
+let exportState = { source: null, svg: null, title: '' };
+
+/** 把一个 SVG 字符串填进预览框。用 innerHTML 而不是 img：矢量图随窗口缩放不糊。 */
+function showExportPreview(svgText, { source, title, sub }) {
+  exportState = { source, svg: svgText, title };
+  el.exportTitle.textContent = title;
+  el.exportSub.textContent = sub || '';
+  el.exportError.hidden = true;
+  el.exportPreview.innerHTML = svgText;
+
+  // 让预览里的 SVG 自适应容器
+  const svg = el.exportPreview.querySelector('svg');
+  if (svg) {
+    svg.removeAttribute('width');
+    svg.removeAttribute('height');
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    svg.style.width = '100%';
+    svg.style.height = '100%';
+  }
+
+  // 按来源决定可保存的格式
+  const formats = source === 'varna'
+    ? [['svg', '保存 SVG'], ['png', '保存 PNG'], ['eps', '保存 EPS']]
+    : [['svg', '保存 SVG'], ['png', '保存 PNG']];
+  el.exportSaveButtons.innerHTML = formats.map(([f, label], i) => (
+    `<button class="btn${i === 0 ? ' btn-primary' : ''}" type="button" `
+    + `data-export-fmt="${f}">${label}</button>`
+  )).join('');
+
+  el.exportDialog.showModal();
+}
+
+async function openBuiltinExportPreview() {
+  const svg = buildExportSvg(el.svgScope ? el.svgScope.value : 'full');
+  if (!svg) { toast('还没有结构可以导出'); return; }
+  showExportPreview(svg, {
+    source: 'builtin',
+    title: '出图预览 — 内置渲染器',
+    sub: '矢量图，可直接插入论文或用 Illustrator / Inkscape 继续编辑。',
+  });
+}
+
+async function openVarnaExportPreview() {
+  if (!state.sequence) { toast('还没有序列'); return; }
+  const v = state.status && state.status.varna;
+  if (v && !v.available) {
+    addMessage('error', 'VARNA 不可用：' + (v.problems || []).join('；'));
+    toast('VARNA 不可用，请改用内置出图');
+    return;
+  }
+  const structure = pairsToStructure(state.sequence.length, state.pairs);
+  setBusy(true, 'VARNA 出图中…');
+  try {
+    const res = await fetch('/api/render/varna?fmt=svg', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sequence: state.sequence,
+        structure,
+        algorithm: el.varnaAlgo.value,
+        period_num: parseInt(el.periodNum.value, 10) || 10,
+        bp_style: el.bpstyle.value || null,
+        color_values: colorValues(),
+        color_style: '0:#FFFFFF;0.5:#4E93CF;1:#143A63',
+        color_min: 0, color_max: 1,
+      }),
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      let msg = t;
+      try { msg = JSON.parse(t).detail || t; } catch { /* 原样 */ }
+      throw new Error(msg);
+    }
+    const svg = await res.text();
+    const javaSrc = v && v.java_source === 'bundled' ? '随包 JRE' : '系统 Java';
+    showExportPreview(svg, {
+      source: 'varna',
+      title: '出图预览 — VARNA',
+      sub: `算法 ${el.varnaAlgo.value} · Java 来源：${javaSrc}。SVG / EPS 为矢量格式。`,
+    });
+  } catch (e) {
+    addMessage('error', 'VARNA 出图失败：' + e.message);
+    toast('VARNA 出图失败');
+  } finally {
+    setBusy(false);
+  }
+}
+
+/**
+ * 保存预览里的图。内置出图的 PNG 由浏览器把 SVG 光栅化；
+ * VARNA 的 PNG/EPS 需要后端重新出图（浏览器的光栅化结果不代表 VARNA 的原始输出）。
+ */
+async function saveExport(fmt) {
+  const structure = pairsToStructure(state.sequence.length, state.pairs);
+
+  if (fmt === 'svg') {
+    if (exportState.source === 'varna' && exportState.svg) {
+      downloadBlob(new Blob([exportState.svg], { type: 'image/svg+xml;charset=utf-8' }),
+        'rna_varna.svg');
+    } else {
+      downloadBlob(new Blob([exportState.svg], { type: 'image/svg+xml;charset=utf-8' }),
+        'rna_structure.svg');
+    }
+    toast('已保存 SVG');
+    el.exportDialog.close();
+    return;
+  }
+
+  if (exportState.source === 'varna') {
+    // 让后端按 VARNA 自己的渲染器出图，保证与预览一致且分辨率可控
+    setBusy(true, '导出中…');
+    try {
+      const res = await fetch(`/api/render/varna?fmt=${fmt}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sequence: state.sequence, structure,
+          algorithm: el.varnaAlgo.value,
+          period_num: parseInt(el.periodNum.value, 10) || 10,
+          bp_style: el.bpstyle.value || null,
+          color_values: colorValues(),
+          color_style: '0:#FFFFFF;0.5:#4E93CF;1:#143A63',
+          color_min: 0, color_max: 1,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      downloadBlob(await res.blob(), `rna_varna.${fmt}`);
+      toast(`已保存 ${fmt.toUpperCase()}`);
+      el.exportDialog.close();
+    } catch (e) {
+      el.exportError.textContent = '导出失败：' + e.message;
+      el.exportError.hidden = false;
+    } finally {
+      setBusy(false);
+    }
+    return;
+  }
+
+  // 内置出图的 PNG
+  const url = URL.createObjectURL(new Blob([exportState.svg], { type: 'image/svg+xml;charset=utf-8' }));
+  try {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error('SVG 光栅化失败'));
+      img.src = url;
+    });
+    const scale = 3;
+    const w = Math.max(1, Math.round((img.naturalWidth || 1000) * scale));
+    const h = Math.max(1, Math.round((img.naturalHeight || 1000) * scale));
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const blob = await new Promise((resolve) => cv.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('浏览器未能生成 PNG');
+    downloadBlob(blob, 'rna_structure.png');
+    toast(`已保存 PNG（${w}×${h}）`);
+    el.exportDialog.close();
+  } catch (e) {
+    el.exportError.textContent = `PNG 导出失败（${e.message}），可以改存 SVG。`;
+    el.exportError.hidden = false;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/* ═══════════════════════ 对照预览（当前 vs MFE） ═══════════════════════ */
+
+function pairKeySet(pairs) {
+  const s = new Set();
+  for (const [i, j] of pairs) s.add(`${Math.min(i, j)},${Math.max(i, j)}`);
+  return s;
+}
+
+async function openCompare() {
+  const r = state.result;
+  if (!r || !r.mfe_structure) {
+    toast('还没有可对照的 MFE 结构，先折叠一次');
+    return;
+  }
+  if (!state.sequence) return;
+
+  const curPairs = state.pairs;
+  const mfeParsed = parseStructure(r.mfe_structure);
+  const mfePairs = mfeParsed.pairs;
+
+  setBusy(true, '准备对照视图…');
+  try {
+    // 当前结构用现有布局；MFE 结构需要单独排一次版
+    let leftLayout = r.layout;
+    let rightLayout;
+    if (r.mfe_structure === r.structure && r.layout) {
+      rightLayout = r.layout;              // 两者相同，直接复用
+    } else {
+      rightLayout = await api('/api/layout', {
+        sequence: state.sequence,
+        structure: r.mfe_structure,
+        layout: el.layout.value,
+      });
+    }
+    if (!leftLayout) {
+      leftLayout = await api('/api/layout', {
+        sequence: state.sequence,
+        structure: pairsToStructure(state.sequence.length, curPairs),
+        layout: el.layout.value,
+      });
+    }
+
+    // 只在一边出现的配对 → 高亮
+    const curSet = pairKeySet(curPairs);
+    const mfeSet = pairKeySet(mfePairs);
+    const diffLeft = new Set([...curSet].filter((k) => !mfeSet.has(k)));
+    const diffRight = new Set([...mfeSet].filter((k) => !curSet.has(k)));
+
+    const period = parseInt(el.periodNum.value, 10) || 0;
+    drawStructure(el.compareLeft, {
+      sequence: state.sequence,
+      layout: leftLayout,
+      pairs: curPairs,
+      breaks: r.layout ? (r.layout.breaks || []) : [],
+      forbidden: state.forbidden,
+      selected: null,
+      colorMap: null,
+      period,
+      diffPairs: diffLeft,
+      interactive: false,
+    });
+    drawStructure(el.compareRight, {
+      sequence: state.sequence,
+      layout: rightLayout,
+      pairs: mfePairs,
+      breaks: r.layout ? (r.layout.breaks || []) : [],
+      forbidden: new Set(),
+      selected: null,
+      colorMap: null,
+      period,
+      diffPairs: diffRight,
+      interactive: false,
+    });
+
+    el.compareLeftDg.textContent = r.infeasible || r.energy == null
+      ? 'ΔG 不可用'
+      : `ΔG ${r.energy.toFixed(2)} kcal/mol`;
+    el.compareRightDg.textContent = r.mfe_energy == null
+      ? 'ΔG 不可用'
+      : `ΔG ${r.mfe_energy.toFixed(2)} kcal/mol`;
+
+    const d = r.delta_from_mfe;
+    const common = [...curSet].filter((k) => mfeSet.has(k)).length;
+    el.compareSummary.textContent = d == null
+      ? ''
+      : (Math.abs(d) < 0.05
+        ? '两者完全一致'
+        : `当前结构比 MFE 高 ${d.toFixed(2)} kcal/mol`);
+    el.compareDetail.textContent =
+      `共有配对 ${common} 对 · 当前独有 ${diffLeft.size} 对 · MFE 独有 ${diffRight.size} 对`;
+
+    el.compareOverlay.hidden = false;
+    el.btnCompare.classList.add('is-on');
+    el.btnCompare.setAttribute('aria-pressed', 'true');
+  } catch (e) {
+    addMessage('error', '对照视图生成失败：' + e.message);
+    toast('对照视图生成失败');
+  } finally {
+    setBusy(false);
+  }
+}
+
+function closeCompare() {
+  el.compareOverlay.hidden = true;
+  el.btnCompare.classList.remove('is-on');
+  el.btnCompare.setAttribute('aria-pressed', 'false');
+}
+
+/**
+ * 本地先检查新配对是否与已有配对交叉。
+ * 交叉 = 假结，ViennaRNA 的近邻模型算不了 ΔG，后端会返回 400。
+ * 与其让用户看到一条报错，不如在这里就给出解释。
+ */
+function crossesExisting(pairs, i, j) {
+  for (const [a, b] of pairs) {
+    if (a === i || a === j || b === i || b === j) continue;
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    const [ni, nj] = i < j ? [i, j] : [j, i];
+    if ((ni < lo && lo < nj && nj < hi) || (lo < ni && ni < hi && hi < nj)) return true;
+  }
+  return false;
+}
+
+/* ═══════════════════ 区段标注（结构域 / 定位高亮） ═══════════════════ */
+
+/**
+ * 算出当前该在画布上显示哪些色带。
+ * 结构域标注和「序列定位」的高亮走同一套渲染，只是来源不同。
+ */
+function activeBands() {
+  const bands = [];
+  for (const d of state.domains) {
+    bands.push({ start: d.start, end: d.end, color: d.color, label: d.name });
+  }
+  if (state.locatedRange) {
+    bands.push({
+      start: state.locatedRange[0],
+      end: state.locatedRange[1],
+      color: '#8A93A0',
+      label: null,
+    });
+  }
+  return bands;
+}
+
+/* ═══════════════════ 假结：本地检测，不出 400 ═══════════════════ */
+
+/**
+ * 找出所有互相交叉的配对（也就是假结）。
+ * ViennaRNA 的近邻模型算不了假结，后端会返回 400 —— 与其把报错甩给用户，
+ * 不如在前端就识别出来，给出解释，并且把坐标照常重排好。
+ */
+function findCrossings(pairs) {
+  const norm = pairs.map(([i, j]) => (i < j ? [i, j] : [j, i])).sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (let a = 0; a < norm.length; a++) {
+    const [i, j] = norm[a];
+    for (let b = a + 1; b < norm.length; b++) {
+      const [k, l] = norm[b];
+      if (k >= j) break;          // 后面的配对起点更靠右，不可能再交叉
+      if (l > j) out.push([norm[a], norm[b]]);
+    }
+  }
+  return out;
+}
+
+function fmtPair(p) {
+  return `#${Math.min(p[0], p[1]) + 1}–#${Math.max(p[0], p[1]) + 1}`;
+}
+
+/**
+ * 假结状态下不走 /api/evaluate（那会 400），但仍要重排坐标，
+ * 否则画布会停在旧状态。环形布局本身能显示假结，所以图依然可用。
+ */
+async function showPseudoknot(crossings, structure) {
+  clearMessages();
+  const [a, b] = crossings[0];
+  addMessage('warn',
+    `当前结构含假结：${fmtPair(a)} 与 ${fmtPair(b)} 互相交叉。`
+    + '近邻热力学模型不支持假结，所以这个结构算不出 ΔG —— 这是模型的固有限制，不是程序出错。');
+  addMessage('note', '结构图仍可正常显示与编辑。要恢复 ΔG，解除交叉的其中一对即可。');
+
+  try {
+    const data = await api('/api/layout', {
+      sequence: state.sequence, structure, layout: el.layout.value,
+    });
+    if (state.result) {
+      state.result.layout = data;
+      state.result.structure = structure;
+      state.result.energy = null;
+      state.result.infeasible = false;
+      state.result.has_pseudoknot = true;
+      state.result.mfe_energy = state.result.mfe_energy ?? null;
+    }
+    state.fitPending = false;    // 保留用户当前视角，避免每次编辑都跳回适应窗口
+    renderMeter(state.result);
+    render();
+  } catch (e) {
+    addMessage('error', e.message);
+  }
+}
+
+/* ═══════════════════ 序列定位 ═══════════════════ */
+
+function reverseComplement(s) {
+  const map = { A: 'U', U: 'A', G: 'C', C: 'G', N: 'N' };
+  return s.split('').reverse().map((c) => map[c] || c).join('');
+}
+
+/** 把视角挪到某个碱基上（保持当前缩放倍数）。 */
+function centerOn(idx) {
+  const layout = state.result && state.result.layout;
+  if (!layout || !layout.points || !layout.points[idx]) return;
+  const p = layout.points[idx];
+  const v = state.view;
+  state.view = { x: p.x - v.w / 2, y: p.y - v.h / 2, w: v.w, h: v.h };
+  applyViewBox();
+}
+
+/**
+ * 定位框支持两种输入：
+ *   · 纯数字      → 跳到该位置
+ *   · 序列片段    → 在序列里查找（找不到就试反向互补，RNA 研究里很常用）
+ */
+function locateInSequence() {
+  const raw = (el.locateInput.value || '').trim();
+  if (!state.sequence) { toast('还没有序列'); return; }
+  if (!raw) { toast('输入位置编号或序列片段'); return; }
+  const n = state.sequence.length;
+
+  if (/^\d+$/.test(raw)) {
+    const pos = parseInt(raw, 10);
+    if (pos < 1 || pos > n) { toast(`位置超出范围（1–${n}）`); return; }
+    state.locatedRange = [pos - 1, pos - 1];
+    state.selection = pos - 1;
+    state.fitPending = false;
+    render();
+    centerOn(pos - 1);
+    toast(`已定位到 #${pos}`);
+    return;
+  }
+
+  const q = raw.replace(/[^A-Za-z]/g, '').toUpperCase().replace(/T/g, 'U');
+  if (!q) { toast('没识别出有效的序列片段'); return; }
+
+  const hit = state.sequence.indexOf(q);
+  if (hit >= 0) {
+    state.locatedRange = [hit, hit + q.length - 1];
+    state.selection = hit;
+    state.fitPending = false;
+    render();
+    centerOn(hit);
+    toast(`在 #${hit + 1}–#${hit + q.length} 找到（${q.length} nt）`);
+    return;
+  }
+
+  const rc = reverseComplement(q);
+  const hit2 = state.sequence.indexOf(rc);
+  if (hit2 >= 0) {
+    state.locatedRange = [hit2, hit2 + rc.length - 1];
+    state.selection = hit2;
+    state.fitPending = false;
+    render();
+    centerOn(hit2);
+    toast(`未找到原序列，但在 #${hit2 + 1} 找到它的反向互补`);
+    return;
+  }
+
+  state.locatedRange = null;
+  render();
+  toast('序列中没有找到这段片段');
+}
+
+function clearLocatedRange() {
+  if (!state.locatedRange) return;
+  state.locatedRange = null;
+}
+
+/* ═══════════════════ 折叠过渡动画（VARNA 风格） ═══════════════════ */
+
+/**
+ * 结构变化时让碱基从旧坐标平滑滑到新坐标，而不是瞬间跳变。
+ * 手工建模时特别有用：能看清「加这一对之后整条链是怎么重新排布的」。
+ *
+ * 做法是先把所有元素画到新位置，再整体倒推回旧位置，然后逐帧插值。
+ * 这样只改属性、不重建 DOM，帧率稳定。
+ */
+let foldAnimHandle = null;
+
+function prefersReducedMotion() {
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function animateFold(svgEl, fromPts, toPts, fromPairs, toPairs, duration = 380) {
+  if (foldAnimHandle) { cancelAnimationFrame(foldAnimHandle); foldAnimHandle = null; }
+  if (prefersReducedMotion()) return;
+  if (!fromPts || !toPts || fromPts.length !== toPts.length || fromPts.length === 0) return;
+
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  /**
+   * 欠阻尼弹簧的阶跃响应：会先冲过头一点再回落，看起来「有弹性」。
+   * zeta 越小越弹（1 表示临界阻尼、完全不弹），omega 控制抖动频率。
+   */
+  const spring = (t, zeta = 0.42, omega = 15) => {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    const wd = omega * Math.sqrt(1 - zeta * zeta);
+    return 1 - Math.exp(-zeta * omega * t)
+      * (Math.cos(wd * t) + (zeta * omega / wd) * Math.sin(wd * t));
+  };
+
+  // 位移越大的碱基弹得越明显：弹幅小的时候看不出弹性会显得很假
+  const dist = toPts.map((q, i) => (fromPts[i] ? Math.hypot(q.x - fromPts[i].x, q.y - fromPts[i].y) : 0));
+  const maxDist = Math.max(...dist, 1e-6);
+  const ampOf = (i) => Math.min(1, 0.35 + 0.65 * (dist[i] / maxDist));
+
+  // 收集需要跟着动的元素
+  const nodes = [];
+  svgEl.querySelectorAll('.nt[data-i]').forEach((g) => {
+    const i = +g.dataset.i;
+    if (fromPts[i]) nodes.push({ g, i });
+  });
+
+  const pairsNow = new Map();
+  for (const [i, j] of toPairs) pairsNow.set(`${i},${j}`, { i, j });
+  const pairsOld = new Set(fromPairs.map(([i, j]) => `${i},${j}`));
+
+  const lines = [];
+  svgEl.querySelectorAll('.bp-line[data-a]').forEach((el2) => {
+    const a = +el2.dataset.a, b = +el2.dataset.b;
+    lines.push({ el: el2, a, b, isNew: !pairsOld.has(`${a},${b}`) });
+  });
+
+  const backs = [];
+  svgEl.querySelectorAll('.backbone[data-i]').forEach((el2) => {
+    backs.push({ el: el2, i: +el2.dataset.i });
+  });
+
+  const nums = [];
+  svgEl.querySelectorAll('.nt-num[data-i]').forEach((el2) => {
+    nums.push({ el: el2, i: +el2.dataset.i, ox: +el2.dataset.ox, oy: +el2.dataset.oy });
+  });
+
+  const t0 = performance.now();
+  // 每个碱基一个进度；沿链加一点延迟，像一道波从 5' 传到 3'
+  const spread = 70;
+  const tOf = (i, elapsed) => {
+    const delay = (i / Math.max(1, toPts.length - 1)) * spread;
+    const local = (elapsed - delay) / duration;
+    if (local <= 0) return 0;
+    const e = spring(local) * ampOf(i) + (1 - ampOf(i)) * Math.min(1, local * 3);
+    return e;
+  };
+
+  const step = (now) => {
+    const elapsed = now - t0;
+    const raw = Math.min(1, elapsed / (duration + spread));
+    const t = 1;   // 线条端点各自用自己的进度，见下
+
+    for (const { g, i } of nodes) {
+      const ti = tOf(i, elapsed);
+      const x = lerp(fromPts[i].x, toPts[i].x, ti);
+      const y = lerp(fromPts[i].y, toPts[i].y, ti);
+      const c = g.querySelector('.nt-circle');
+      const tx = g.querySelector('.nt-text');
+      if (c) { c.setAttribute('cx', x); c.setAttribute('cy', y); }
+      if (tx) { tx.setAttribute('x', x); tx.setAttribute('y', y); }
+    }
+    for (const { el: l, i } of backs) {
+      const ta = tOf(i, elapsed), tb = tOf(i + 1, elapsed);
+      const x1 = lerp(fromPts[i].x, toPts[i].x, ta);
+      const y1 = lerp(fromPts[i].y, toPts[i].y, ta);
+      const x2 = lerp(fromPts[i + 1].x, toPts[i + 1].x, tb);
+      const y2 = lerp(fromPts[i + 1].y, toPts[i + 1].y, tb);
+      l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+      l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    }
+    for (const { el: l, a, b, isNew } of lines) {
+      const ta = tOf(a, elapsed), tb = tOf(b, elapsed);
+      const x1 = lerp(fromPts[a] ? fromPts[a].x : toPts[a].x, toPts[a].x, ta);
+      const y1 = lerp(fromPts[a] ? fromPts[a].y : toPts[a].y, toPts[a].y, ta);
+      const x2 = lerp(fromPts[b] ? fromPts[b].x : toPts[b].x, toPts[b].x, tb);
+      const y2 = lerp(fromPts[b] ? fromPts[b].y : toPts[b].y, toPts[b].y, tb);
+      if (l.tagName === 'line') {
+        l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+        l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+      } else {
+        // 线性布局下的弧线：半径随两端距离变化
+        const rad = Math.abs(x2 - x1) / 2;
+        l.setAttribute('d', `M ${x1} ${y1} A ${rad} ${rad} 0 0 1 ${x2} ${y2}`);
+      }
+      if (isNew) l.setAttribute('opacity', String(0.85 * Math.min(1, ta * 2)));  // 新配对淡入
+    }
+    for (const { el: t2, i, ox, oy } of nums) {
+      if (!fromPts[i]) continue;
+      const ti = tOf(i, elapsed);
+      const dx = toPts[i].x - fromPts[i].x;
+      const dy = toPts[i].y - fromPts[i].y;
+      t2.setAttribute('x', toPts[i].x + ox - dx * (1 - ti));
+      t2.setAttribute('y', toPts[i].y + oy - dy * (1 - ti));
+    }
+
+    if (raw < 1) {
+      foldAnimHandle = requestAnimationFrame(step);
+    } else {
+      foldAnimHandle = null;
+    }
+  };
+  foldAnimHandle = requestAnimationFrame(step);
+}
+
+/* ═══════════════════ 结构域标注 ═══════════════════ */
+
+/** 预设配色：都经过挑选，彼此可区分，在白底和印刷下都能看清 */
+const DOMAIN_COLORS = ['#2F6FB5', '#D2912A', '#4E9143', '#BE4A47', '#7B5EA7', '#3E8E9E'];
+
+function nextDomainColor() {
+  const used = new Set(state.domains.map((d) => d.color));
+  return DOMAIN_COLORS.find((c) => !used.has(c)) || DOMAIN_COLORS[state.domains.length % DOMAIN_COLORS.length];
+}
+
+function addDomain() {
+  const n = state.sequence.length;
+  if (!n) { toast('先粘贴一条序列'); return; }
+
+  const name = (el.domainName.value || '').trim();
+  const start = parseInt(el.domainStart.value, 10);
+  const end = parseInt(el.domainEnd.value, 10);
+
+  if (!name) { toast('给结构域起个名字'); el.domainName.focus(); return; }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    toast('填写起止位置，或先用「定位」选中区间再点「用高亮区间」');
+    return;
+  }
+  if (start < 1 || end > n || start > end) {
+    toast(`位置要在 1–${n} 之间，且起点不大于终点`);
+    return;
+  }
+
+  const s0 = start - 1, e0 = end - 1;
+  const overlap = state.domains.find((d) => !(e0 < d.start || s0 > d.end));
+  if (overlap) {
+    toast(`与已有结构域「${overlap.name}」重叠，请调整范围`);
+    return;
+  }
+
+  state.domains.push({ name, start: s0, end: e0, color: nextDomainColor() });
+  state.domains.sort((a, b) => a.start - b.start);
+
+  el.domainName.value = '';
+  el.domainStart.value = '';
+  el.domainEnd.value = '';
+  state.locatedRange = null;
+  renderDomains();
+  render();
+  saveSession();
+  toast(`已添加结构域「${name}」（#${start}–#${end}）`);
+}
+
+function removeDomain(idx) {
+  const d = state.domains[idx];
+  if (!d) return;
+  state.domains.splice(idx, 1);
+  renderDomains();
+  render();
+  saveSession();
+  toast(`已删除「${d.name}」`);
+}
+
+function fillRangeFromLocated() {
+  const n = state.sequence.length;
+  if (!state.locatedRange) { toast('先用「定位」选中一段区间'); return; }
+  el.domainStart.value = String(state.locatedRange[0] + 1);
+  el.domainEnd.value = String(state.locatedRange[1] + 1);
+  if (!el.domainName.value) el.domainName.focus();
+  void n;
+}
+
+function renderDomains() {
+  const list = el.domainList;
+  if (!state.domains.length) {
+    list.innerHTML = '<p class="empty">还没有标注结构域。</p>';
+    return;
+  }
+  list.innerHTML = state.domains.map((d, i) => (
+    `<div class="domain-row" data-idx="${i}">`
+    + `<span class="domain-swatch" style="background:${d.color}"></span>`
+    + `<span class="domain-row-name">${escapeHtml(d.name)}</span>`
+    + `<span class="domain-row-range">#${d.start + 1}–#${d.end + 1}</span>`
+    + `<span class="domain-row-len">${d.end - d.start + 1} nt</span>`
+    + `<button class="domain-del" data-del="${i}" type="button" title="删除">×</button>`
+    + `</div>`
+  )).join('');
+}
+
+/* ═══════════════════ 分段折叠 ═══════════════════ */
+
+/**
+ * 按结构域切开，每段独立折叠，再把结果拼回整体坐标并统一评估。
+ *
+ * 用处：判断结构域是否**独立折叠**。如果各段单独折叠的能量之和与整体折叠
+ * 差不多，说明域间耦合弱；差很多则说明域间存在相互作用。
+ */
+async function foldByDomains() {
+  if (!state.sequence) { toast('先粘贴一条序列'); return; }
+  if (state.domains.length < 1) { toast('先添加至少一个结构域'); return; }
+
+  const n = state.sequence.length;
+  const doms = [...state.domains].sort((a, b) => a.start - b.start);
+  const temp = parseFloat(el.temperature.value) || 37;
+  const engine = el.engine.value;
+
+  setBusy(true, `分段折叠中（共 ${doms.length} 段）…`);
+  clearMessages();
+  try {
+    const perDomain = [];
+    const allPairs = [];
+    const uncovered = [];
+    let cursor = 0;
+    for (const d of doms) {
+      if (d.start > cursor) uncovered.push([cursor, d.start - 1]);
+      cursor = Math.max(cursor, d.end + 1);
+    }
+    if (cursor < n) uncovered.push([cursor, n - 1]);
+
+    for (const d of doms) {
+      const sub = state.sequence.slice(d.start, d.end + 1);
+      const r = await api('/api/predict', {
+        sequence: sub,
+        engine,
+        method: el.method.value,
+        temperature: temp,
+        layout: el.layout.value,
+        with_probabilities: false,
+      });
+      const parsed = parseStructure(r.structure);
+      for (const [i, j] of parsed.pairs) allPairs.push([d.start + i, d.start + j]);
+      perDomain.push({
+        name: d.name,
+        range: `#${d.start + 1}–#${d.end + 1}`,
+        len: sub.length,
+        dg: r.energy,
+        pairs: parsed.pairs.length,
+      });
+    }
+
+    const structure = pairsToStructure(n, allPairs);
+    const data = await api('/api/evaluate', {
+      sequence: state.sequence,
+      structure,
+      engine,
+      temperature: temp,
+      layout: el.layout.value,
+      compare_mfe: true,
+    });
+
+    state.pairs = allPairs;
+    state.fitPending = false;
+    adoptResult(data);
+    pushHistory(`分段折叠（${doms.length} 段）`);
+    reportNotes(data);
+
+    // 各段结果与整体对比
+    const sumDg = perDomain.reduce((t, d) => t + (d.dg || 0), 0);
+    for (const d of perDomain) {
+      addMessage('note',
+        `${d.name}（${d.range}，${d.len} nt）：ΔG ${d.dg == null ? '不可用' : d.dg.toFixed(2)}，${d.pairs} 个配对`);
+    }
+    if (uncovered.length) {
+      addMessage('note',
+        `未标注为结构域的区域（${uncovered.map(([a, b]) => `#${a + 1}–#${b + 1}`).join('、')}）`
+        + '按单链处理，没有参与折叠。');
+    }
+    if (data.energy != null) {
+      const vsMfe = data.mfe_energy != null ? data.energy - data.mfe_energy : null;
+      addMessage('note',
+        `各段 ΔG 之和 ${sumDg.toFixed(2)}，拼回整体后 ΔG ${data.energy.toFixed(2)}`
+        + (vsMfe != null
+          ? `；整条序列的 MFE 是 ${data.mfe_energy.toFixed(2)}，相差 ${vsMfe > 0 ? '+' : ''}${vsMfe.toFixed(2)} kcal/mol。`
+            + (Math.abs(vsMfe) < 2
+              ? '差距很小，说明各结构域基本是独立折叠的。'
+              : '差距较大，提示结构域之间可能存在相互作用，或整体折叠另有更优解。')
+          : '。'));
+    }
+    toast(`分段折叠完成（${doms.length} 段）`);
+  } catch (e) {
+    addMessage('error', '分段折叠失败：' + e.message);
+    toast('分段折叠失败');
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ═══════════════════ 会话自动保存 ═══════════════════ */
+
+/**
+ * 把当前工作状态存到浏览器本地，下次打开自动恢复。
+ * 手工搭结构容易一坐就是半小时，刷新一下全丢太伤了。
+ *
+ * 用 localStorage 而不是后端存盘：应用本来就在本机跑，localStorage 足够，
+ * 也免去「用户的文件被写到哪里去了」这类问题。
+ */
+const SESSION_KEY = 'rna-studio.session.v1';
+const SESSION_VERSION = 1;
+
+function collectSession() {
+  return {
+    v: SESSION_VERSION,
+    savedAt: Date.now(),
+    sequence: state.sequence,
+    sequenceB: el.seqB.value,
+    mode: state.mode,
+    engine: el.engine.value,
+    method: el.method.value,
+    layout: el.layout.value,
+    temperature: el.temperature.value,
+    colorMode: el.colorMode.value,
+    period: el.periodNum.value,
+    svgScope: el.svgScope.value,
+    bpStyleDraw: el.bpStyleDraw ? el.bpStyleDraw.value : '',
+    varnaAlgo: el.varnaAlgo.value,
+    constraints: el.constraints.value,
+    probingMethod: el.probingMethod.value,
+    probingData: el.probingData.value,
+    probingM: el.probingM.value,
+    probingB: el.probingB.value,
+    pairs: state.pairs,
+    forbidden: [...state.forbidden],
+    domains: state.domains.map((d) => ({ ...d })),
+  };
+}
+
+let saveTimer = null;
+function saveSession() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(collectSession()));
+    } catch (e) {
+      // 隐私模式 / 配额满：静默失败，不影响使用
+    }
+  }, 400);
+}
+
+function clearSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) { /* 忽略 */ }
+}
+
+/** 返回是否成功恢复了内容 */
+function restoreSession() {
+  let raw = null;
+  try { raw = localStorage.getItem(SESSION_KEY); } catch (e) { return false; }
+  if (!raw) return false;
+
+  let d = null;
+  try { d = JSON.parse(raw); } catch (e) { return false; }
+  if (!d || d.v !== SESSION_VERSION || !d.sequence) return false;
+
+  // 序列与各类参数
+  el.seq.value = d.sequence;
+  el.seqB.value = d.sequenceB || '';
+  if (d.engine) el.engine.value = d.engine;
+  if (d.method) refreshMethodOptions();     // 选项依赖引擎，先刷再设
+  if (d.method) el.method.value = d.method;
+  if (d.layout) { el.layout.value = d.layout; state.layout = d.layout; }
+  if (d.temperature != null) el.temperature.value = d.temperature;
+  if (d.colorMode) el.colorMode.value = d.colorMode;
+  if (d.period != null) el.periodNum.value = d.period;
+  if (d.svgScope) el.svgScope.value = d.svgScope;
+  if (d.bpStyleDraw && el.bpStyleDraw) el.bpStyleDraw.value = d.bpStyleDraw;
+  if (d.varnaAlgo) el.varnaAlgo.value = d.varnaAlgo;
+  if (d.probingMethod) {
+    el.probingMethod.value = d.probingMethod;
+    el.probingBlock.hidden = !d.probingMethod;
+  }
+  if (d.probingData != null) el.probingData.value = d.probingData;
+  if (d.probingM != null) el.probingM.value = d.probingM;
+  if (d.probingB != null) el.probingB.value = d.probingB;
+
+  // 结构状态
+  state.sequence = d.sequence;
+  state.pairs = Array.isArray(d.pairs) ? d.pairs.map((p) => [p[0], p[1]]) : [];
+  state.forbidden = new Set(d.forbidden || []);
+  state.domains = Array.isArray(d.domains) ? d.domains : [];
+  state.colorMode = el.colorMode.value;
+
+  el.constraints.value = d.constraints && d.constraints.length === d.sequence.length
+    ? d.constraints
+    : '.'.repeat(d.sequence.length);
+  el.statLen.textContent = d.sequence.length;
+  const gc = d.sequence.length
+    ? Math.round(((d.sequence.match(/[GC]/g) || []).length / d.sequence.length) * 100) : 0;
+  el.statGc.textContent = d.sequence.length ? gc + '%' : '–';
+  el.statPairs.textContent = state.pairs.length;
+  syncConstraintReadouts();
+
+  // 模式：手动建模要保留结构，所以绕过 setMode 的清空逻辑
+  if (d.mode === 'cofold' || d.mode === 'manual') {
+    state.mode = d.mode;
+    el.modeBtns.forEach((bt) => {
+      const on = bt.dataset.mode === d.mode;
+      bt.classList.toggle('is-on', on);
+      bt.setAttribute('aria-selected', String(on));
+    });
+    el.cofoldBlock.hidden = d.mode !== 'cofold';
+    el.statModeWrap.hidden = d.mode === 'cofold';
+    refreshMethodOptions();
+  }
+  return true;
+}
+
+
+/* ═══════════════════ 点阵图（dot plot） ═══════════════════ */
+
+/**
+ * 点阵图是 RNA 领域最标准的「第二种视角」：把 n×n 的配对概率画成一个矩阵，
+ * 一眼能看出哪些螺旋是确定的、哪些区域在系综里摇摆不定。
+ *
+ * 约定参考 ViennaRNA 的实现（PS_dot_plot 的文档）：
+ *   · 横轴 j、纵轴 i，只画 i<j 的上三角
+ *   · **方块面积**与配对概率成正比（不是颜色深浅）
+ *   · 下三角叠当前结构，便于对照「预测的结构落在概率高的地方吗」
+ *
+ * 矩阵可能有 n²/2 个格子，直接建 DOM 会爆；所以先把概率画进 canvas，
+ * 再以 data URL 塞进 SVG 的 <image>，坐标轴和结构点仍用 SVG 画（保证可导出）。
+ */
+const DOT_PLOT_PX = 900;
+const DOT_PLOT_MIN_P = 0.005;   // 低于这个概率不画，否则整片糊成灰色
+
+async function ensureProbabilities() {
+  if (state.probMap.size) return true;
+  if (!state.sequence) return false;
+  try {
+    const d = await api('/api/probabilities', {
+      sequence: state.sequence,
+      engine: el.engine.value,
+      temperature: parseFloat(el.temperature.value) || 37,
+    });
+    state.probMap.clear();
+    for (const [i, j, p] of d.probabilities) {
+      state.probMap.set(`${i},${j}`, p);
+      state.probMap.set(`${j},${i}`, p);
+    }
+    return true;
+  } catch (e) {
+    addMessage('warn', '配对概率计算失败，点阵图只能显示当前结构：' + e.message);
+    return false;
+  }
+}
+
+function drawDotPlot() {
+  const n = state.sequence.length;
+  const svg = el.canvas;
+  svg.innerHTML = '';
+  if (!n) { el.canvasEmpty.hidden = false; return; }
+  el.canvasEmpty.hidden = true;
+  el.legend.innerHTML =
+    '<span class="legend-item"><span class="legend-swatch" style="background:rgba(70,130,190,.55)"></span>方块面积 ∝ 配对概率（上三角）</span>'
+    + '<span class="legend-item"><span class="legend-swatch" style="background:#8C2F2A;border-radius:50%"></span>当前结构（下三角，与上三角镜像）</span>'
+    + '<span class="legend-item" style="color:var(--muted-solid)">螺旋呈现为垂直于主对角线的短串</span>';
+
+  // ── 1. 用 canvas 画概率方块 ──
+  const S = DOT_PLOT_PX;
+  const cv = document.createElement('canvas');
+  cv.width = S; cv.height = S;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, S, S);
+
+  const cell = S / n;              // 每个格子占多少像素
+  // 半透明浅蓝：重叠处自然加深，能看出概率的层次
+  ctx.fillStyle = 'rgba(70, 130, 190, 0.55)';
+  let drawn = 0;
+  state.probMap.forEach((p, key) => {
+    const [i, j] = key.split(',').map(Number);
+    if (i >= j) return;            // 只画上三角
+    if (p < DOT_PLOT_MIN_P) return;
+    // 面积正比于 p → 边长正比于 sqrt(p)
+    const side = cell * Math.sqrt(Math.min(1, p)) * 0.95;
+    if (side < 0.6) return;
+    // 屏幕坐标：x 向右为 j，y 向下为 i（所以小 i 在上方 = 上三角）
+    const cx = (j + 0.5) * cell;
+    const cy = (i + 0.5) * cell;
+    ctx.fillRect(cx - side / 2, cy - side / 2, side, side);
+    drawn++;
+  });
+
+  // 主对角线画一条淡线，作为参照
+  ctx.strokeStyle = '#D3DAE3';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 0); ctx.lineTo(S, S);
+  ctx.stroke();
+
+  // ── 2. 组装 SVG：底图 + 坐标轴 + 当前结构点 ──
+  const pad = S * 0.07;
+  const total = S + pad * 2;
+  svg.setAttribute('viewBox', `0 0 ${total} ${total}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  const img = mk('image', {
+    x: pad, y: pad, width: S, height: S,
+    href: cv.toDataURL('image/png'),
+    preserveAspectRatio: 'none',
+  });
+  img.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', cv.toDataURL('image/png'));
+  svg.appendChild(img);
+
+  // 轴框
+  svg.appendChild(mk('rect', {
+    x: pad, y: pad, width: S, height: S,
+    fill: 'none', stroke: '#D3DAE3', 'stroke-width': 1,
+  }));
+
+  // 刻度：每 step 个位置标一个
+  const step = n <= 80 ? 10 : (n <= 300 ? 50 : 100);
+  const tickFs = Math.max(10, S * 0.018);
+  for (let k = step; k <= n; k += step) {
+    const px = pad + k * cell;
+    const py = pad + k * cell;
+    svg.appendChild(mk('line', {
+      x1: px, y1: pad, x2: px, y2: pad + S, stroke: '#E4E9EF', 'stroke-width': 1,
+    }));
+    svg.appendChild(mk('line', {
+      x1: pad, y1: py, x2: pad + S, y2: py, stroke: '#E4E9EF', 'stroke-width': 1,
+    }));
+    const tx = mk('text', {
+      x: px, y: pad + S + tickFs * 1.4, 'text-anchor': 'middle',
+      'font-size': tickFs, fill: '#647183', 'font-family': 'ui-monospace, monospace',
+    });
+    tx.textContent = String(k);
+    svg.appendChild(tx);
+    const ty = mk('text', {
+      x: pad - tickFs * 0.5, y: py, 'text-anchor': 'end', 'dominant-baseline': 'middle',
+      'font-size': tickFs, fill: '#647183', 'font-family': 'ui-monospace, monospace',
+    });
+    ty.textContent = String(k);
+    svg.appendChild(ty);
+  }
+  const axisLabel = (x, y, text, rotate) => {
+    const t = mk('text', {
+      x, y, 'text-anchor': 'middle', 'font-size': tickFs * 1.1,
+      fill: '#3B4757', 'font-family': 'ui-sans-serif, sans-serif',
+      transform: rotate ? `rotate(-90 ${x} ${y})` : null,
+    });
+    t.textContent = text;
+    svg.appendChild(t);
+  };
+  axisLabel(pad + S / 2, pad + S + tickFs * 3.4, '位置 j —— 配对的 3′ 端', false);
+  axisLabel(pad - tickFs * 3.8, pad + S / 2, '位置 i —— 配对的 5′ 端', true);
+
+  // ── 3. 下三角叠当前结构 ──
+  // 上三角是配对概率，下三角是「当前画出来的结构」，两者关于主对角线镜像。
+  // 看的时候把下三角的点和上三角的方块对着比：点落在方块大的地方，
+  // 说明这个配对在系综里站得住脚；点在空白处则要多留个心眼。
+  const rd = Math.max(1.4, cell * 0.46);
+  for (const [i, j] of state.pairs) {
+    const cx = pad + (i + 0.5) * cell;
+    const cy = pad + (j + 0.5) * cell;
+    svg.appendChild(mk('circle', {
+      cx, cy, r: rd * 1.7, fill: '#ffffff', opacity: 0.9,   // 白描边让点从方块里跳出来
+    }));
+    svg.appendChild(mk('circle', { cx, cy, r: rd, fill: '#8C2F2A' }));
+  }
+
+  // 结构域色带在点阵图里没有意义，这里不画
+  state.fitView = { x: 0, y: 0, w: total, h: total };
+  state.view = { ...state.fitView };
+  applyViewBox();
+}
+
+/* ═══════════════════ 彩虹渐变着色（5′ → 3′） ═══════════════════ */
+
+/**
+ * 按位置做彩虹渐变是最常见的「表达方向性」的方式（R2DT 等工具默认就这么配）。
+ * 它能一眼看出哪段是 5′、哪段是 3′，也能让读者顺着颜色追踪链的走向。
+ */
+const RAINBOW_STOPS = [
+  [0.00, [ 26,  76, 140]],
+  [0.22, [ 46, 139, 168]],
+  [0.42, [ 78, 168,  96]],
+  [0.60, [208, 176,  52]],
+  [0.80, [206, 108,  52]],
+  [1.00, [158,  48,  74]],
+];
+
+function rainbowColor(t) {
+  const v = Math.max(0, Math.min(1, t));
+  for (let k = 0; k < RAINBOW_STOPS.length - 1; k++) {
+    const [t0, c0] = RAINBOW_STOPS[k];
+    const [t1, c1] = RAINBOW_STOPS[k + 1];
+    if (v <= t1) {
+      const u = (v - t0) / (t1 - t0 || 1);
+      return c0.map((x, m) => Math.round(x + (c1[m] - x) * u));
+    }
+  }
+  return RAINBOW_STOPS[RAINBOW_STOPS.length - 1][1];
+}
+
 
 /* ─────────────────────────── 启动 ─────────────────────────── */
 
 async function init() {
+  // 自检：el 里为 null 的引用说明 HTML 的 id 对不上，这类错误只会在用到时才炸，
+  // 提前报出来能省掉很多排查时间。
+  const missing = Object.entries(el).filter(([, v]) => v == null).map(([k]) => k);
+  if (missing.length) console.warn('[RNA Studio] 以下 DOM 引用没找到对应元素：', missing);
+
   setupCanvasInteraction();
   bindEvents();
-  const demo = 'GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA';
-  el.seq.value = demo;
-  syncSequence();
+
+  // 先看看有没有上次没做完的工作
+  let resumed = false;
+  try { resumed = restoreSession(); } catch (e) { resumed = false; }
+
+  if (!resumed) {
+    const demo = 'GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA';
+    el.seq.value = demo;
+    syncSequence();
+  }
 
   try {
     await loadStatus();
@@ -1377,7 +2825,24 @@ async function init() {
     return;
   }
   state.colorMode = el.colorMode.value;
-  await doFold();
+  renderHistory();
+  updateHistoryButtons();
+  renderDomains();
+
+  // 关闭/刷新前补存一次，免得最后一步改动没落盘
+  window.addEventListener('beforeunload', () => {
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(collectSession()));
+    } catch (e) { /* 忽略 */ }
+  });
+
+  if (resumed && state.sequence && state.pairs.length) {
+    addMessage('note', '已恢复上次的工作进度。');
+    state.fitPending = true;
+    await doEvaluate();
+  } else if (state.sequence) {
+    await doFold();
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => { void init(); });

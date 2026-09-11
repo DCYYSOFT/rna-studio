@@ -207,8 +207,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": APP_NAME,
-            "CFBundleShortVersionString": "1.1.0",
-            "CFBundleVersion": "1.1.0",
+            "CFBundleShortVersionString": "0.0.2",
+            "CFBundleVersion": "0.0.2",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "11.0",
             # 应用只在本机 127.0.0.1 上跑服务，不需要任何网络权限

@@ -55,6 +55,12 @@
         <span id="stat-mode-wrap">配对 <b id="stat-pairs">0</b></span>
       </div>
 
+      <div class="locate-row">
+        <input id="locate-input" type="text" spellcheck="false"
+               placeholder="输入位置(如 120)或序列片段定位">
+        <button id="btn-locate" class="btn btn-quiet" type="button">定位</button>
+      </div>
+
       <div class="btn-row">
         <button id="btn-fold" class="btn btn-primary" type="button">折叠</button>
         <button id="btn-mfe" class="btn" type="button" title="恢复为最小自由能结构">取 MFE</button>
@@ -78,11 +84,12 @@
       </label>
 
       <label class="field">
-        <span class="field-label">布局</span>
+        <span class="field-label">展示风格</span>
         <select id="layout">
-          <option value="naview">naview — 经典三叶草/茎环</option>
-          <option value="circular">环形 — 可显示假结</option>
-          <option value="linear">线性 — 弧线图，适合长链</option>
+          <option value="naview">结构图 — 经典三叶草/茎环（naview）</option>
+          <option value="circular">结构图 — 环形，可显示假结</option>
+          <option value="linear">结构图 — 弧线图，适合长链</option>
+          <option value="dotplot">点阵图 — 配对概率矩阵</option>
         </select>
       </label>
 
@@ -154,17 +161,69 @@
     </section>
 
     <section class="block">
+      <h2 class="block-title">结构域标注</h2>
+      <p class="block-hint">
+        给序列片段命名并配色（例如「适配体结构域」「表达平台」），
+        画布上会用彩色色带标出，导出的图里也带着。
+        先用上面的「定位」选中区间，再点「用高亮区间」可以自动填入起止位置。
+      </p>
+
+      <div class="domain-form">
+        <input id="domain-name" type="text" spellcheck="false" placeholder="结构域名称">
+        <div class="domain-range">
+          <input id="domain-start" type="number" min="1" placeholder="起">
+          <span class="dash">–</span>
+          <input id="domain-end" type="number" min="1" placeholder="止">
+          <button class="link-btn" id="btn-domain-from-range" type="button">用高亮区间</button>
+        </div>
+        <button id="btn-domain-add" class="btn btn-quiet" type="button">添加结构域</button>
+      </div>
+
+      <div id="domain-list" class="domain-list"></div>
+
+      <div class="btn-row">
+        <button id="btn-fold-domains" class="btn" type="button"
+                title="每个结构域单独折叠，再拼回整体评估">
+          按结构域分段折叠
+        </button>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2 class="block-title">编辑历史</h2>
+      <p class="block-hint">
+        每次建立/解除配对、标记禁配、以及折叠操作都会记一步。
+        点任意一步可以直接跳回那个状态。
+      </p>
+      <div class="readouts readouts-tight">
+        <span>共 <b id="stat-history">0</b> 步</span>
+        <span>当前第 <b id="stat-history-pos">0</b> 步</span>
+      </div>
+      <div id="history-list" class="history-list"></div>
+    </section>
+
+    <section class="block">
       <h2 class="block-title">出图</h2>
       <p class="block-hint">
-        下面两项设置对画布显示和两种出图都生效。
+        下面两项设置对画布显示和两种出图都生效。导图会先弹出预览，确认后再保存。
       </p>
 
       <label class="field">
         <span class="field-label">碱基着色依据</span>
         <select id="color-mode">
           <option value="base">按碱基种类</option>
+          <option value="rainbow">按位置（5′→3′ 彩虹渐变）</option>
           <option value="pairprob">按配对概率（热图）</option>
           <option value="probing">按探测反应性（热图）</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="field-label">碱基对画法</span>
+        <select id="bp-style-draw">
+          <option value="">细线（默认）</option>
+          <option value="ladder">梯形 — 像螺旋的梯级</option>
+          <option value="ribbon">色带 — 整段螺旋一条粗带</option>
         </select>
       </label>
 
@@ -176,8 +235,7 @@
       <div class="divider"><span>内置出图（不需要 Java）</span></div>
 
       <div class="btn-row">
-        <button id="btn-svg" class="btn btn-primary" type="button">导出 SVG</button>
-        <button id="btn-png" class="btn" type="button">导出 PNG</button>
+        <button id="btn-svg" class="btn btn-primary" type="button">预览并导出…</button>
       </div>
 
       <label class="field">
@@ -213,9 +271,7 @@
       </label>
 
       <div class="btn-row">
-        <button id="btn-varna-svg" class="btn" type="button">VARNA SVG</button>
-        <button id="btn-varna-png" class="btn" type="button">PNG</button>
-        <button id="btn-varna-eps" class="btn btn-quiet" type="button">EPS</button>
+        <button id="btn-varna-svg" class="btn" type="button">预览并导出…</button>
       </div>
 
       <span class="field-hint" id="varna-hint"></span>
@@ -267,7 +323,21 @@
           <button class="tool" id="zoom-fit" type="button" title="适应窗口">适应</button>
           <button class="tool" id="zoom-in" type="button" title="放大">+</button>
         </div>
+        <div class="tool-group" role="group" aria-label="编辑">
+          <button class="tool" id="btn-undo" type="button" title="撤销（Ctrl/Cmd+Z）" disabled>撤销</button>
+          <button class="tool" id="btn-redo" type="button" title="重做（Ctrl/Cmd+Shift+Z）" disabled>重做</button>
+        </div>
+        <div class="tool-group" role="group" aria-label="预览">
+          <button class="tool tool-toggle" id="btn-readonly" type="button"
+                  aria-pressed="false" title="只读预览：锁定画布，避免查看结构时误改配对">只读</button>
+          <button class="tool tool-toggle" id="btn-compare" type="button"
+                  aria-pressed="false" title="对照预览：当前结构与 MFE 结构并排比较">对照 MFE</button>
+        </div>
         <div class="legend" id="legend"></div>
+      </div>
+
+      <div class="readonly-banner" id="readonly-banner" hidden>
+        只读预览中 — 画布已锁定，点击不会修改配对。再点一次「只读」即可继续编辑。
       </div>
       <div class="canvas-scroll" id="canvas-scroll">
         <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
@@ -277,6 +347,38 @@
         </div>
       </div>
       <div class="hover-readout" id="hover-readout"></div>
+
+      <!-- 对照预览：盖住画布，左右并排显示当前结构与 MFE 结构 -->
+      <div class="compare-overlay" id="compare-overlay" hidden>
+        <div class="compare-head">
+          <div>
+            <span class="compare-title">对照预览</span>
+            <span class="compare-sub" id="compare-summary"></span>
+          </div>
+          <button class="tool" id="compare-close" type="button">关闭</button>
+        </div>
+        <div class="compare-body">
+          <div class="compare-pane">
+            <div class="compare-pane-head">
+              <span>当前结构</span>
+              <span class="mono" id="compare-left-dg">—</span>
+            </div>
+            <svg id="compare-left" class="compare-svg" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+          <div class="compare-pane">
+            <div class="compare-pane-head">
+              <span>MFE 结构</span>
+              <span class="mono" id="compare-right-dg">—</span>
+            </div>
+            <svg id="compare-right" class="compare-svg" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+        </div>
+        <div class="compare-foot">
+          <span class="legend-item"><span class="legend-swatch" style="background:#2F6FB5"></span>两者都有</span>
+          <span class="legend-item"><span class="legend-swatch" style="background:#D2912A"></span>只在一边出现</span>
+          <span id="compare-detail"></span>
+        </div>
+      </div>
     </div>
 
     <div class="messages" id="messages"></div>
@@ -321,6 +423,20 @@
 
 <div id="toast" class="toast" hidden></div>
 <div id="busy" class="busy" hidden><span class="spinner"></span><span id="busy-text">计算中…</span></div>
+
+<!-- 出图预览：先看到最终图像，确认后再保存 -->
+<dialog id="export-dialog" class="dialog dialog-wide">
+  <div class="dialog-form">
+    <h2 class="dialog-title" id="export-title">出图预览</h2>
+    <p class="dialog-sub" id="export-sub"></p>
+    <div class="export-preview" id="export-preview"></div>
+    <p class="dialog-error" id="export-error" hidden></p>
+    <div class="dialog-actions">
+      <button class="btn btn-quiet" id="export-cancel" type="button">取消</button>
+      <span id="export-save-buttons" class="save-row"></span>
+    </div>
+  </div>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>
